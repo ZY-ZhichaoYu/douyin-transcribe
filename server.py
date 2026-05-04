@@ -29,7 +29,7 @@ from pathlib import Path
 from playwright.async_api import async_playwright
 from mcp.server.fastmcp import FastMCP
 
-mcp = FastMCP("Douyin Analysis")
+mcp = FastMCP("Douyin Analysis", log_level="ERROR")
 
 _URL_RE = re.compile(r'https?://\S+')
 _UA = (
