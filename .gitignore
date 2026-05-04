@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+env/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Whisper model cache (large)
+models/
+*.bin
+
+# Local downloads / temp output
+downloads/
+*.mp4
+*.wav
+*.m4a
+tmp/
+
+# Local override
+.env

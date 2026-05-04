@@ -1,0 +1,9 @@
+# Core
+playwright>=1.40
+faster-whisper>=1.0
+
+# MCP server (server.py)
+mcp>=1.0
+
+# Web UI (app.py) — optional, only needed if you run the Gradio interface
+gradio>=4.40
