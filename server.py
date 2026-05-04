@@ -129,16 +129,30 @@ def _sorted_candidates(video: dict) -> list[tuple[int, str]]:
     return result
 
 
+def _sorted_progressive_candidates(video: dict) -> list[tuple[int, str]]:
+    """返回普通 MP4 候选；DASH 候选通常是纯视频分片，不适合直接给 Whisper。"""
+    result = []
+    for item in video.get("bit_rate", []):
+        if item.get("format") != "mp4":
+            continue
+        urls = _cdn_urls(item)
+        if urls:
+            result.append((item.get("bit_rate", 0), urls[0]))
+    result.sort()
+    return result
+
+
 def _pick_url_for_transcription(video: dict) -> str:
     """
     选取用于转录的最小视频 URL。
-    策略：跳过绝对最低码率条目（通常是视频无音轨的 DASH 分片），
-    取第二低码率（约 730k，20MB，含音轨）。
-    若只有一个条目则直接使用。回退到 play_addr。
+    策略：优先选择普通 MP4 候选中码率最低的版本。DASH 候选常是纯视频分片，
+    直接交给 Whisper/PyAV 会因为没有音频流而解码失败。
+    若没有普通 MP4 候选，再回退到全部候选和 play_addr。
     """
+    cands = _sorted_progressive_candidates(video)
+    if cands:
+        return cands[0][1]
     cands = _sorted_candidates(video)
-    if len(cands) >= 2:
-        return cands[1][1]   # 第二低 = 最小含音轨版本
     if cands:
         return cands[0][1]
     # 回退

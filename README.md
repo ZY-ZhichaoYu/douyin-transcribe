@@ -45,6 +45,60 @@ python server.py
 
 第一次运行会自动下载 Whisper `tiny` 模型（~39MB）。
 
+### 常规开始（推荐）
+
+如果你是第一次在本机跑 Python 项目，建议按下面的完整流程来，避免依赖污染到系统 Python。
+
+#### Windows PowerShell
+
+```powershell
+git clone https://github.com/ZY-ZhichaoYu/douyin-transcribe.git
+cd douyin-transcribe
+
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+playwright install chromium
+
+python app.py
+```
+
+看到类似下面的输出就说明服务启动成功：
+
+```text
+Running on local URL: http://127.0.0.1:7860
+```
+
+然后打开浏览器访问 [http://127.0.0.1:7860](http://127.0.0.1:7860)，粘贴抖音分享链接或整段分享文本即可。
+
+#### macOS / Linux
+
+```bash
+git clone https://github.com/ZY-ZhichaoYu/douyin-transcribe.git
+cd douyin-transcribe
+
+python3 -m venv .venv
+source .venv/bin/activate
+
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+playwright install chromium
+
+python app.py
+```
+
+#### 验证安装
+
+可以用下面的命令确认核心依赖可导入：
+
+```bash
+python -c "import gradio, playwright, faster_whisper; print('ok')"
+```
+
+如果网页打不开，先看终端里 `python app.py` 是否还在运行。浏览器显示 `127.0.0.1 refused to connect` 通常表示本地服务没有启动成功，而不是浏览器问题。
+
 ### MCP 配置
 
 #### Claude Desktop
@@ -134,6 +188,9 @@ A: 跑一次 `playwright install chromium`。
 **Q: faster-whisper 报 CUDA 错误？**
 A: 默认配置是 CPU (`device="cpu", compute_type="int8"`)，不需要 GPU。如果你装了 CUDA 想加速，把 `_transcribe_sync` 里的 `device` 改 `"cuda"`。
 
+**Q: faster-whisper / PyAV 报 `tuple index out of range`？**
+A: 通常是拿到了只有视频、没有音频的 DASH 分片。本项目现在转录时会优先选择普通 MP4 候选，以避免这个问题。如果仍遇到，请先更新到最新代码。
+
 **Q: Claude Desktop 调用工具一直超时？**
 A: 用 `douyin_to_text` 而不是 `analyze_douyin`，前者立即返回 job_id，规避超时。
 
@@ -154,9 +211,21 @@ MIT License — 详见 [LICENSE](./LICENSE)
 
 ### What is this?
 
-A tool to extract spoken text from Douyin (Chinese TikTok) videos.
-Paste a share link → get the transcript. Useful when you want to feed the
-content of a Douyin video into Claude / GPT / Gemini for summary or analysis.
+Douyin to Text downloads a Douyin (Chinese TikTok) video from a share link and
+transcribes the speech locally with Whisper.
+
+Paste a Douyin share URL, or the full share text copied from the Douyin app, and
+get a transcript that you can send to Claude, ChatGPT, Gemini, or another LLM
+for summary, translation, note taking, or analysis.
+
+### Features
+
+- Web UI for non-technical users, powered by Gradio
+- MCP server for Claude Desktop / Claude Code
+- Local transcription with faster-whisper
+- No browser cookie export required
+- Supports plain Douyin URLs and full app share text
+- Automatically avoids DASH video-only streams when selecting a file for transcription
 
 ### Why not yt-dlp?
 
@@ -165,7 +234,7 @@ gets locked by WebView2 even when the browser is closed.
 This tool uses headless Chromium instead, so the cookie is generated on-the-fly
 and never needs to be exported from the host browser.
 
-### Usage
+### Quick Start
 
 ```bash
 git clone https://github.com/ZY-ZhichaoYu/douyin-transcribe.git
@@ -180,8 +249,123 @@ python app.py        # then open http://127.0.0.1:7860
 python server.py
 ```
 
-See the Chinese section above for MCP integration details and tool reference.
+The first run downloads the default Whisper `tiny` model.
+
+### Standard Setup
+
+Use a virtual environment if you want a cleaner local install.
+
+#### Windows PowerShell
+
+```powershell
+git clone https://github.com/ZY-ZhichaoYu/douyin-transcribe.git
+cd douyin-transcribe
+
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+playwright install chromium
+
+python app.py
+```
+
+Open [http://127.0.0.1:7860](http://127.0.0.1:7860), paste a Douyin link, and start transcription.
+
+#### macOS / Linux
+
+```bash
+git clone https://github.com/ZY-ZhichaoYu/douyin-transcribe.git
+cd douyin-transcribe
+
+python3 -m venv .venv
+source .venv/bin/activate
+
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+playwright install chromium
+
+python app.py
+```
+
+### MCP Setup
+
+#### Claude Desktop
+
+Edit `%APPDATA%\Claude\claude_desktop_config.json` on Windows, or the equivalent Claude Desktop config file on macOS:
+
+```json
+{
+  "mcpServers": {
+    "douyin": {
+      "command": "python",
+      "args": ["C:\\path\\to\\douyin-transcribe\\server.py"]
+    }
+  }
+}
+```
+
+#### Claude Code
+
+```bash
+claude mcp add douyin -s user python /path/to/douyin-transcribe/server.py
+```
+
+If your client has a short MCP timeout, prefer the asynchronous workflow:
+
+1. Call `douyin_to_text(url)` and keep the returned `job_id`.
+2. Call `get_transcript_result(job_id)` until the transcript is ready.
+
+### MCP Tools
+
+| Tool | Purpose |
+|------|---------|
+| `analyze_douyin(url)` | Synchronous download and transcription |
+| `douyin_to_text(url)` | Start an asynchronous background transcription job |
+| `get_transcript_result(job_id)` | Poll an asynchronous transcription job |
+| `download_douyin(url)` | Download the source video only |
+| `transcribe_video(file_path)` | Transcribe a local video or audio file |
+
+### Model Choice
+
+The default model is `tiny`, which is fast and good enough for summaries. Use
+`small` or `medium` when you need cleaner text:
+
+```python
+analyze_douyin(url, model_size="small")
+```
+
+Available model names include `tiny`, `base`, `small`, `medium`, and `large-v3`.
+
+### Troubleshooting
+
+**`127.0.0.1 refused to connect`**
+
+The local Gradio service is not running. Start it with `python app.py` and keep
+that terminal open.
+
+**Playwright says the browser executable does not exist**
+
+Run:
+
+```bash
+playwright install chromium
+```
+
+**Transcription fails with `tuple index out of range`**
+
+This usually means the selected video file has no audio stream. Update to the
+latest code; transcription now prefers progressive MP4 streams and avoids DASH
+video-only fragments.
+
+### Limitations
+
+- Tested mainly with single-video Douyin links
+- Private or login-only videos are not supported
+- Speech recognition accuracy depends on audio quality and model size
+- Douyin may change its web APIs, which can break metadata extraction
 
 ### License
 
-MIT
+MIT License. See [LICENSE](./LICENSE).

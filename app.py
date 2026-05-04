@@ -134,7 +134,6 @@ with gr.Blocks(title="抖音转文字 / Douyin to Text") as demo:
                 text_out = gr.Textbox(
                     label="文字稿（可复制）",
                     lines=20,
-                    show_copy_button=True,
                 )
 
         go_btn.click(
@@ -147,7 +146,7 @@ with gr.Blocks(title="抖音转文字 / Douyin to Text") as demo:
         url2 = gr.Textbox(label="抖音链接", lines=2)
         dl_btn = gr.Button("下载（最高画质）", variant="primary")
         dl_status = gr.Markdown()
-        dl_path = gr.Textbox(label="本地文件路径", show_copy_button=True)
+        dl_path = gr.Textbox(label="本地文件路径")
         dl_btn.click(fn=download_only, inputs=url2, outputs=[dl_path, dl_status])
 
     gr.Markdown(
