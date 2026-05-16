@@ -106,22 +106,45 @@ async def _get_video_object(page_url: str) -> dict:
                     },
                 )
                 page = await ctx.new_page()
-                try:
-                    async with page.expect_response(
-                        lambda resp: "aweme/v1/web/aweme/detail" in resp.url,
-                        timeout=_DETAIL_RESPONSE_TIMEOUT * 1000,
-                    ) as response_info:
-                        try:
-                            await page.goto(page_url, wait_until="domcontentloaded", timeout=45000)
-                        except Exception as e:
-                            last_error = e
+                loop = asyncio.get_running_loop()
+                detail_future = loop.create_future()
+                parser_tasks = set()
 
-                    response = await response_info.value
-                    payload = await response.json()
-                    if payload.get("aweme_detail"):
-                        return payload["aweme_detail"].get("video", {})
+                async def parse_detail_response(resp):
+                    nonlocal last_error
+                    try:
+                        payload = await resp.json()
+                    except Exception as e:
+                        last_error = e
+                        return
+                    if payload.get("aweme_detail") and not detail_future.done():
+                        detail_future.set_result(payload)
+
+                def on_response(resp):
+                    if detail_future.done():
+                        return
+                    if "aweme/v1/web/aweme/detail" not in resp.url:
+                        return
+                    task = asyncio.create_task(parse_detail_response(resp))
+                    parser_tasks.add(task)
+                    task.add_done_callback(parser_tasks.discard)
+
+                page.on("response", on_response)
+                try:
+                    await page.goto(page_url, wait_until="commit", timeout=45000)
                 except Exception as e:
                     last_error = e
+
+                try:
+                    payload = await asyncio.wait_for(
+                        detail_future, timeout=_DETAIL_RESPONSE_TIMEOUT
+                    )
+                    return payload["aweme_detail"].get("video", {})
+                except asyncio.TimeoutError as e:
+                    last_error = e
+                finally:
+                    for task in parser_tasks:
+                        task.cancel()
             finally:
                 await browser.close()
 
