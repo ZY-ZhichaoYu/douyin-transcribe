@@ -204,7 +204,7 @@ Bilibili：
 
 - 用 `yt-dlp` 提取视频信息和直链。
 - 转录时优先下载音频流。
-- 下载视频时使用 `bv*[ext=mp4]+ba[ext=m4a]/bv*+ba/b`，并让 ffmpeg 合并成 MP4。
+- 下载视频时优先选择 H.264/AVC 视频流和 M4A 音频流，并让 ffmpeg 合并成 MP4。这样比 HEVC/H.265 更容易在 Windows 默认播放器和浏览器里正常出画面。
 
 Whisper：
 
@@ -242,6 +242,9 @@ playwright install chromium
 
 **Q: Bilibili 下载视频失败，但转文字可以？**
 A: 多数是没有 ffmpeg，导致视频流和音频流不能合并。执行 `ffmpeg -version` 检查。
+
+**Q: 下载的 MP4 只有声音，没有画面？**
+A: 多数是播放器不支持 HEVC/H.265。当前版本已优先下载 H.264/AVC 格式；先 `git pull` 后重新下载。如果仍有问题，可以换 VLC 播放器验证。
 
 **Q: 转录结果错字很多？**
 A: 先把模型从 `tiny` 或 `base` 调到 `small`。财经、技术、英文夹杂视频建议至少用 `base` 或 `small`。

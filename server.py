@@ -21,7 +21,9 @@ import asyncio
 import json
 import os
 import re
+import shutil
 import ssl
+import subprocess
 import tempfile
 import time
 import urllib.request
@@ -61,7 +63,13 @@ WHISPER_MODEL = "tiny"
 _ALLOWED_MODELS = {"tiny", "base", "small", "medium", "large-v3"}
 _DETAIL_RESPONSE_TIMEOUT = 30.0
 _DETAIL_RESPONSE_RETRIES = 2
-_BILIBILI_VIDEO_FORMAT = "bv*[ext=mp4]+ba[ext=m4a]/bv*+ba/b"
+_BILIBILI_VIDEO_FORMAT = (
+    "bv*[vcodec^=avc1][ext=mp4]+ba[ext=m4a]/"
+    "bv*[vcodec^=avc1]+ba/"
+    "bv*[ext=mp4]+ba[ext=m4a]/"
+    "bv*+ba/"
+    "b[vcodec^=avc1]/b"
+)
 
 
 # ── URL 提取 ──────────────────────────────────────────────
@@ -520,6 +528,48 @@ def _download_bilibili_transcription_media_sync(url: str, out_dir: str) -> str:
     return out_path
 
 
+def _probe_media_streams(path: str) -> list[dict] | None:
+    if not shutil.which("ffprobe"):
+        return None
+    proc = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=codec_type,codec_name,width,height,duration",
+            "-of",
+            "json",
+            path,
+        ],
+        text=True,
+        capture_output=True,
+    )
+    if proc.returncode != 0:
+        return None
+    try:
+        data = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return None
+    streams = data.get("streams")
+    return streams if isinstance(streams, list) else None
+
+
+def _has_video_stream(path: str) -> bool | None:
+    streams = _probe_media_streams(path)
+    if streams is None:
+        return None
+    return any(stream.get("codec_type") == "video" for stream in streams)
+
+
+def _ensure_video_stream(path: str) -> None:
+    has_video = _has_video_stream(path)
+    if has_video is False:
+        raise RuntimeError(
+            "下载完成，但输出文件没有视频画面。请更新 yt-dlp/ffmpeg 后重试，或换 VLC 播放器验证。"
+        )
+
+
 def _find_downloaded_file(out_dir: str, before: set[str]) -> str:
     after = {
         os.path.join(out_dir, name)
@@ -527,6 +577,12 @@ def _find_downloaded_file(out_dir: str, before: set[str]) -> str:
         if os.path.isfile(os.path.join(out_dir, name))
     }
     created = sorted(after - before, key=lambda path: os.path.getmtime(path), reverse=True)
+    video_created = [path for path in created if _has_video_stream(path) is True]
+    if video_created:
+        return video_created[0]
+    mp4_created = [path for path in created if Path(path).suffix.lower() == ".mp4"]
+    if mp4_created:
+        return mp4_created[0]
     if created:
         return created[0]
     existing = sorted(after, key=lambda path: os.path.getmtime(path), reverse=True)
@@ -561,8 +617,11 @@ def _download_bilibili_video_sync(url: str, out_dir: str) -> str:
         for key in ("filepath", "filename", "_filename"):
             path = item.get(key)
             if path and os.path.exists(path):
+                _ensure_video_stream(path)
                 return path
-    return _find_downloaded_file(out_dir, before)
+    path = _find_downloaded_file(out_dir, before)
+    _ensure_video_stream(path)
+    return path
 
 
 # ── 下载（urllib，无 ffmpeg 网络调用）───────────────────
@@ -631,6 +690,7 @@ async def _download_video_file(real_url: str, out_dir: str) -> tuple[str, str]:
         dl_url = _pick_url_for_download(video)
         out_path = os.path.join(out_dir, "douyin_video.mp4")
         await loop.run_in_executor(_DOWNLOAD_EXECUTOR, _download_sync, dl_url, out_path)
+        await loop.run_in_executor(_DOWNLOAD_EXECUTOR, _ensure_video_stream, out_path)
         return out_path, platform
     if platform == "bilibili":
         out_path = await loop.run_in_executor(
