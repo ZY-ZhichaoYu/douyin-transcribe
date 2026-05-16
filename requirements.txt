@@ -1,6 +1,7 @@
 # Core
 playwright>=1.40
 faster-whisper>=1.0
+yt-dlp>=2026.3.17
 
 # MCP server (server.py)
 mcp>=1.0

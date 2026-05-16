@@ -1,17 +1,19 @@
 """
-Douyin Video Analysis MCP Server
+Douyin / Bilibili Video Analysis MCP Server
 
 工具一览：
-  - analyze_douyin(url)        : 一键转录（同步，~25s）。适用于 Claude Code（无超时压力）。
-  - douyin_to_text(url)        : 异步任务，立即返回 job_id。适用于 Claude Desktop（硬超时）。
+  - analyze_video(url)         : 一键转录（同步）。支持抖音和 Bilibili。
+  - video_to_text(url)         : 异步任务，立即返回 job_id。适用于 Claude Desktop（硬超时）。
                                  后续用 get_transcript_result(job_id) 取结果。
   - get_transcript_result(...) : 轮询/等待异步任务结果。
-  - download_douyin(url)       : 只下载（最高画质），返回本地文件路径。
+  - download_video(url)        : 只下载视频，返回本地文件路径。
   - transcribe_video(file)     : 转录本地视频/音频文件。
+  - analyze_douyin / douyin_to_text / download_douyin: 旧工具名，保留兼容。
 
 Architecture:
   - Playwright (headless Chromium) intercepts aweme/detail API to get signed CDN URLs
-  - urllib downloads the video (no ffmpeg/ffprobe network calls — they hang in MCP context)
+  - yt-dlp extracts and downloads Bilibili media
+  - urllib downloads direct Douyin/Bilibili media URLs where possible
   - faster-whisper transcribes (it internally uses ffmpeg on local files, which is fine)
 """
 
@@ -25,11 +27,12 @@ import urllib.request
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from urllib.parse import urlparse
 
 from playwright.async_api import async_playwright
 from mcp.server.fastmcp import FastMCP
 
-mcp = FastMCP("Douyin Analysis", log_level="ERROR")
+mcp = FastMCP("Video Analysis", log_level="ERROR")
 
 _URL_RE = re.compile(r'https?://\S+')
 _UA = (
@@ -49,12 +52,15 @@ _EXECUTOR = ThreadPoolExecutor(max_workers=1)
 # 如某段音频效果差，可在工具调用时传入 model_size="small"。
 WHISPER_MODEL = "tiny"
 _ALLOWED_MODELS = {"tiny", "base", "small", "medium", "large-v3"}
+_DETAIL_RESPONSE_TIMEOUT = 30.0
+_DETAIL_RESPONSE_RETRIES = 2
+_BILIBILI_VIDEO_FORMAT = "bv*[ext=mp4]+ba[ext=m4a]/bv*+ba/b"
 
 
 # ── URL 提取 ──────────────────────────────────────────────
 
 def _extract_url(text: str) -> str:
-    """从纯URL或抖音App分享文本中提取第一个URL。"""
+    """从纯URL或 App 分享文本中提取第一个URL。"""
     text = text.strip()
     m = _URL_RE.search(text)
     if not m:
@@ -64,6 +70,20 @@ def _extract_url(text: str) -> str:
     return url
 
 
+def _detect_platform(url: str) -> str:
+    """Return the supported site name for a URL."""
+    host = urlparse(url).netloc.lower()
+    if "douyin.com" in host or "iesdouyin.com" in host:
+        return "douyin"
+    if "bilibili.com" in host or host.endswith("b23.tv"):
+        return "bilibili"
+    raise ValueError(f"暂不支持这个网站: {host or url}")
+
+
+def _platform_label(platform: str) -> str:
+    return {"douyin": "抖音", "bilibili": "Bilibili"}.get(platform, platform)
+
+
 # ── Playwright：拦截 aweme/detail API ─────────────────────
 
 async def _get_video_object(page_url: str) -> dict:
@@ -71,51 +91,102 @@ async def _get_video_object(page_url: str) -> dict:
     用 async Playwright 打开抖音页面，拦截 aweme/detail API，
     返回 aweme_detail.video 字典（包含 bit_rate 数组和 play_addr）。
     """
-    detail: list = [None]
+    last_error: Exception | None = None
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        ctx = await browser.new_context(user_agent=_UA)
-        page = await ctx.new_page()
-
-        async def on_response(resp):
-            if detail[0]:
-                return
-            if "aweme/v1/web/aweme/detail" in resp.url:
+    for attempt in range(_DETAIL_RESPONSE_RETRIES):
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            try:
+                ctx = await browser.new_context(
+                    user_agent=_UA,
+                    locale="zh-CN",
+                    viewport={"width": 1280, "height": 720},
+                    extra_http_headers={
+                        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+                    },
+                )
+                page = await ctx.new_page()
                 try:
-                    j = await resp.json()
-                    if j.get("aweme_detail"):
-                        detail[0] = j
-                except Exception:
-                    pass
+                    async with page.expect_response(
+                        lambda resp: "aweme/v1/web/aweme/detail" in resp.url,
+                        timeout=_DETAIL_RESPONSE_TIMEOUT * 1000,
+                    ) as response_info:
+                        try:
+                            await page.goto(page_url, wait_until="domcontentloaded", timeout=45000)
+                        except Exception as e:
+                            last_error = e
 
-        page.on("response", on_response)
-        try:
-            # "commit" = 拿到第一个 HTTP 响应就返回，不等 DOM 解析完
-            await page.goto(page_url, wait_until="commit", timeout=35000)
-        except Exception:
-            pass
+                    response = await response_info.value
+                    payload = await response.json()
+                    if payload.get("aweme_detail"):
+                        return payload["aweme_detail"].get("video", {})
+                except Exception as e:
+                    last_error = e
+            finally:
+                await browser.close()
 
-        # 轮询等待 detail API 响应，最多 12 秒
-        for _ in range(24):
-            if detail[0]:
-                break
-            await asyncio.sleep(0.5)
+        if attempt < _DETAIL_RESPONSE_RETRIES - 1:
+            await asyncio.sleep(1)
 
-        await browser.close()
-
-    if not detail[0]:
-        raise RuntimeError("Playwright 未能拦截到视频信息，请稍后重试")
-
-    return detail[0]["aweme_detail"].get("video", {})
+    suffix = f" ({type(last_error).__name__})" if last_error else ""
+    raise RuntimeError(f"Playwright 未能拦截到视频信息，请稍后重试{suffix}")
 
 
 # ── URL 选取（纯内存操作，无网络调用）────────────────────
 
+def _external_cdn_urls(urls) -> list[str]:
+    """Return public CDN URLs and drop internal douyin.com play endpoints."""
+    raw = []
+    if isinstance(urls, dict):
+        for key in ("main_url", "backup_url", "url_list", "fallback_url"):
+            value = urls.get(key)
+            if isinstance(value, list):
+                raw.extend(value)
+            elif isinstance(value, str):
+                raw.append(value)
+    elif isinstance(urls, list):
+        raw.extend(urls)
+    elif isinstance(urls, str):
+        raw.append(urls)
+
+    result = []
+    for url in raw:
+        if not isinstance(url, str) or not url:
+            continue
+        if "douyin.com" in url:
+            continue
+        if url not in result:
+            result.append(url)
+    return result
+
+
 def _cdn_urls(item: dict) -> list[str]:
     """从 bit_rate 条目中提取外部 CDN URL（排除需要 cookie 的 douyin.com 内部地址）。"""
-    return [u for u in item.get("play_addr", {}).get("url_list", [])
-            if "douyin.com" not in u]
+    return _external_cdn_urls(item.get("play_addr", {}).get("url_list", []))
+
+
+def _sorted_audio_candidates(video: dict) -> list[tuple[int, int, str]]:
+    """Return audio-only CDN candidates sorted by bitrate/size."""
+    result = []
+    for item in video.get("bit_rate_audio", []):
+        meta = item.get("audio_meta") or {}
+        urls = _external_cdn_urls(meta.get("url_list") or {})
+        if urls:
+            result.append((
+                meta.get("bitrate") or item.get("audio_quality") or 0,
+                meta.get("size") or 0,
+                urls[0],
+            ))
+
+    audio = video.get("audio") or {}
+    for key in ("play_url", "play_addr"):
+        value = audio.get(key) or {}
+        urls = _external_cdn_urls(value.get("url_list", []))
+        if urls:
+            result.append((0, 0, urls[0]))
+
+    result.sort(key=lambda item: (item[0], item[1]))
+    return result
 
 
 def _sorted_candidates(video: dict) -> list[tuple[int, str]]:
@@ -144,11 +215,13 @@ def _sorted_progressive_candidates(video: dict) -> list[tuple[int, str]]:
 
 def _pick_url_for_transcription(video: dict) -> str:
     """
-    选取用于转录的最小视频 URL。
-    策略：优先选择普通 MP4 候选中码率最低的版本。DASH 候选常是纯视频分片，
-    直接交给 Whisper/PyAV 会因为没有音频流而解码失败。
-    若没有普通 MP4 候选，再回退到全部候选和 play_addr。
+    选取用于转录的最小音频/视频 URL。
+    策略：优先使用 bit_rate_audio 中的音频流；没有音频流时再选择普通 MP4。
+    DASH 视频候选常是纯视频分片，直接交给 Whisper/PyAV 会因为没有音频流而解码失败。
     """
+    audio_cands = _sorted_audio_candidates(video)
+    if audio_cands:
+        return audio_cands[0][2]
     cands = _sorted_progressive_candidates(video)
     if cands:
         return cands[0][1]
@@ -165,6 +238,9 @@ def _pick_url_for_transcription(video: dict) -> str:
 
 def _pick_url_for_download(video: dict) -> str:
     """选取最高码率的外部 CDN URL（用于全质量下载）。"""
+    cands = _sorted_progressive_candidates(video)
+    if cands:
+        return cands[-1][1]  # 最高码率的自包含 MP4
     cands = _sorted_candidates(video)
     if cands:
         return cands[-1][1]  # 最高码率
@@ -175,13 +251,150 @@ def _pick_url_for_download(video: dict) -> str:
     raise RuntimeError("无法找到可用的视频链接")
 
 
+# ── Bilibili：yt-dlp 提取和下载 ──────────────────────────
+
+def _load_ytdlp():
+    try:
+        from yt_dlp import YoutubeDL
+    except ImportError as e:
+        raise RuntimeError("Bilibili 支持需要安装 yt-dlp：pip install -r requirements.txt") from e
+    return YoutubeDL
+
+
+def _extract_bilibili_info(url: str) -> dict:
+    """Extract Bilibili metadata and direct media URLs with yt-dlp."""
+    YoutubeDL = _load_ytdlp()
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "noprogress": True,
+        "noplaylist": True,
+        "skip_download": True,
+        "http_headers": {"User-Agent": _UA},
+    }
+    with YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+
+    entries = info.get("entries")
+    if entries:
+        first = next((entry for entry in entries if entry), None)
+        if first:
+            info = first
+    return info
+
+
+def _bilibili_headers(info: dict, fmt: dict | None = None) -> dict[str, str]:
+    headers = {"User-Agent": _UA, "Referer": "https://www.bilibili.com/"}
+    for source in (info.get("http_headers") or {}, (fmt or {}).get("http_headers") or {}):
+        for key, value in source.items():
+            if value:
+                headers[key] = value
+    return headers
+
+
+def _is_direct_http_format(fmt: dict) -> bool:
+    protocol = str(fmt.get("protocol") or "")
+    return bool(fmt.get("url")) and protocol.startswith("http") and not fmt.get("fragments")
+
+
+def _format_size(fmt: dict) -> int:
+    return int(fmt.get("filesize") or fmt.get("filesize_approx") or 0)
+
+
+def _pick_bilibili_transcription_format(info: dict) -> dict:
+    formats = [fmt for fmt in info.get("formats", []) if _is_direct_http_format(fmt)]
+    audio = [
+        fmt for fmt in formats
+        if fmt.get("vcodec") == "none" and fmt.get("acodec") not in (None, "none")
+    ]
+    combined = [
+        fmt for fmt in formats
+        if fmt.get("vcodec") not in (None, "none") and fmt.get("acodec") not in (None, "none")
+    ]
+    candidates = audio or combined
+    if not candidates:
+        raise RuntimeError("Bilibili 未返回可直接下载的音频/视频格式")
+    return max(
+        candidates,
+        key=lambda fmt: (
+            float(fmt.get("abr") or fmt.get("tbr") or 0),
+            _format_size(fmt),
+            int(fmt.get("quality") or 0),
+        ),
+    )
+
+
+def _safe_extension(ext: str | None, default: str = "mp4") -> str:
+    ext = (ext or default).lower().lstrip(".")
+    if not re.fullmatch(r"[a-z0-9]{1,8}", ext):
+        return default
+    return ext
+
+
+def _download_bilibili_transcription_media_sync(url: str, out_dir: str) -> str:
+    info = _extract_bilibili_info(url)
+    fmt = _pick_bilibili_transcription_format(info)
+    ext = _safe_extension(fmt.get("ext"), "m4a")
+    out_path = os.path.join(out_dir, f"bilibili_media.{ext}")
+    _download_sync(fmt["url"], out_path, headers=_bilibili_headers(info, fmt))
+    return out_path
+
+
+def _find_downloaded_file(out_dir: str, before: set[str]) -> str:
+    after = {
+        os.path.join(out_dir, name)
+        for name in os.listdir(out_dir)
+        if os.path.isfile(os.path.join(out_dir, name))
+    }
+    created = sorted(after - before, key=lambda path: os.path.getmtime(path), reverse=True)
+    if created:
+        return created[0]
+    existing = sorted(after, key=lambda path: os.path.getmtime(path), reverse=True)
+    if existing:
+        return existing[0]
+    raise RuntimeError("下载完成但未找到输出文件")
+
+
+def _download_bilibili_video_sync(url: str, out_dir: str) -> str:
+    YoutubeDL = _load_ytdlp()
+    before = {
+        os.path.join(out_dir, name)
+        for name in os.listdir(out_dir)
+        if os.path.isfile(os.path.join(out_dir, name))
+    }
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "noprogress": True,
+        "noplaylist": True,
+        "format": _BILIBILI_VIDEO_FORMAT,
+        "merge_output_format": "mp4",
+        "outtmpl": os.path.join(out_dir, "%(title).100B [%(id)s].%(ext)s"),
+        "windowsfilenames": True,
+        "http_headers": {"User-Agent": _UA},
+    }
+    with YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+
+    downloads = info.get("requested_downloads") or []
+    for item in downloads:
+        for key in ("filepath", "filename", "_filename"):
+            path = item.get(key)
+            if path and os.path.exists(path):
+                return path
+    return _find_downloaded_file(out_dir, before)
+
+
 # ── 下载（urllib，无 ffmpeg 网络调用）───────────────────
 
-def _download_sync(video_url: str, out_path: str) -> None:
-    """用 urllib 同步下载视频文件。在线程池中调用。"""
+def _download_sync(video_url: str, out_path: str, headers: dict | None = None) -> None:
+    """用 urllib 同步下载媒体文件。在线程池中调用。"""
+    request_headers = {"User-Agent": _UA, "Referer": "https://www.douyin.com/"}
+    if headers:
+        request_headers.update(headers)
     req = urllib.request.Request(
         video_url,
-        headers={"User-Agent": _UA, "Referer": "https://www.douyin.com/"},
+        headers=request_headers,
     )
     with urllib.request.urlopen(req, context=_SSL_CTX, timeout=90) as r:
         with open(out_path, "wb") as f:
@@ -197,15 +410,76 @@ def _download_sync(video_url: str, out_path: str) -> None:
 def _transcribe_sync(file_path: str, model_size: str = WHISPER_MODEL) -> str:
     """
     用 faster-whisper 转录视频/音频文件。
-    beam_size=1（贪心解码）比 beam_size=5 快约 2-3 倍，中文效果仍够用。
+    beam_size=1（贪心解码）比 beam_size=5 快。语言交给 Whisper 自动识别，
+    避免英文口播被强制按中文解码。
     """
     from faster_whisper import WhisperModel
 
     if model_size not in _ALLOWED_MODELS:
         model_size = WHISPER_MODEL
     model = WhisperModel(model_size, device="cpu", compute_type="int8")
-    segments, _ = model.transcribe(file_path, language="zh", beam_size=1)
+    segments, _ = model.transcribe(file_path, beam_size=1)
     return "\n".join(seg.text.strip() for seg in segments)
+
+
+# ── 通用平台流程 ─────────────────────────────────────────
+
+async def _download_transcription_media(real_url: str, out_dir: str) -> tuple[str, str]:
+    """Download the best media file for transcription and return (path, platform)."""
+    platform = _detect_platform(real_url)
+    loop = asyncio.get_running_loop()
+    if platform == "douyin":
+        video = await _get_video_object(real_url)
+        dl_url = _pick_url_for_transcription(video)
+        out_path = os.path.join(out_dir, "douyin_media.mp4")
+        await loop.run_in_executor(_EXECUTOR, _download_sync, dl_url, out_path)
+        return out_path, platform
+    if platform == "bilibili":
+        out_path = await loop.run_in_executor(
+            _EXECUTOR, _download_bilibili_transcription_media_sync, real_url, out_dir
+        )
+        return out_path, platform
+    raise ValueError(f"暂不支持这个平台: {platform}")
+
+
+async def _download_video_file(real_url: str, out_dir: str) -> tuple[str, str]:
+    """Download the source video and return (path, platform)."""
+    platform = _detect_platform(real_url)
+    loop = asyncio.get_running_loop()
+    if platform == "douyin":
+        video = await _get_video_object(real_url)
+        dl_url = _pick_url_for_download(video)
+        out_path = os.path.join(out_dir, "douyin_video.mp4")
+        await loop.run_in_executor(_EXECUTOR, _download_sync, dl_url, out_path)
+        return out_path, platform
+    if platform == "bilibili":
+        out_path = await loop.run_in_executor(
+            _EXECUTOR, _download_bilibili_video_sync, real_url, out_dir
+        )
+        return out_path, platform
+    raise ValueError(f"暂不支持这个平台: {platform}")
+
+
+async def _transcribe_url_async(url: str, model_size: str = WHISPER_MODEL) -> tuple[str, str, float]:
+    """Download media for a supported URL and transcribe it."""
+    real_url = _extract_url(url)
+    loop = asyncio.get_running_loop()
+    with tempfile.TemporaryDirectory(prefix="video_transcribe_") as tmp:
+        media_path, platform = await _download_transcription_media(real_url, tmp)
+        size_mb = os.path.getsize(media_path) / 1024 / 1024
+        transcript = await loop.run_in_executor(
+            _EXECUTOR, _transcribe_sync, media_path, model_size
+        )
+    return transcript, platform, size_mb
+
+
+async def _download_video_async(url: str) -> tuple[str, str, float]:
+    """Download source video for a supported URL into a persistent temp directory."""
+    real_url = _extract_url(url)
+    out_dir = tempfile.mkdtemp(prefix="video_dl_")
+    video_path, platform = await _download_video_file(real_url, out_dir)
+    size_mb = os.path.getsize(video_path) / 1024 / 1024
+    return video_path, platform, size_mb
 
 
 # ── MCP 工具 ─────────────────────────────────────────────
@@ -213,91 +487,65 @@ def _transcribe_sync(file_path: str, model_size: str = WHISPER_MODEL) -> str:
 @mcp.tool()
 async def analyze_douyin(url: str, model_size: str = WHISPER_MODEL) -> str:
     """
-    抖音视频一键转录：下载最小含音轨版本 → Whisper 转录 → 返回文字稿。
-    自动选取约 20MB 的低码率流（vs 原版 170MB），大幅缩短等待时间。
+    抖音/Bilibili 视频一键转录：下载适合转录的媒体 → Whisper 转录 → 返回文字稿。
 
-    url: 抖音分享链接或App分享文本（自动提取URL）。
+    url: 抖音或 Bilibili 分享链接/分享文本（自动提取URL）。
          支持格式：
            - 纯URL:  https://v.douyin.com/43Hxli09K70/
            - 长URL:  https://www.douyin.com/video/7628423061288682112
+           - Bilibili: https://www.bilibili.com/video/BV...
            - 分享文本: "5.33 复制打开抖音... https://v.douyin.com/xxx/"，自动提取URL
     model_size: Whisper 模型大小，默认 "tiny"（快）。
                 若文字识别明显有误，可改用 "small"（更准但慢约 4x）。
                 可选: tiny / base / small / medium / large-v3
     """
     try:
-        real_url = _extract_url(url)
+        transcript, platform, _ = await _transcribe_url_async(url, model_size)
     except ValueError as e:
         return str(e)
-
-    loop = asyncio.get_event_loop()
-
-    # Step 1: Playwright 拦截视频信息（~10s）
-    try:
-        video = await _get_video_object(real_url)
-    except RuntimeError as e:
-        return f"获取视频信息失败: {e}"
-
-    # Step 2: 选 URL（纯内存，瞬间完成）
-    try:
-        dl_url = _pick_url_for_transcription(video)
-    except RuntimeError as e:
-        return f"下载失败: {e}"
-
-    # Step 3: urllib 下载 + Whisper 转录
-    with tempfile.TemporaryDirectory(prefix="douyin_") as tmp:
-        out_path = os.path.join(tmp, "video.mp4")
-        try:
-            await loop.run_in_executor(_EXECUTOR, _download_sync, dl_url, out_path)
-        except Exception as e:
-            return f"下载失败: {e}"
-
-        try:
-            transcript = await loop.run_in_executor(
-                _EXECUTOR, _transcribe_sync, out_path, model_size
-            )
-        except Exception as e:
-            return f"转录失败: {e}"
+    except Exception as e:
+        return f"转录失败: {e}"
 
     if not transcript.strip():
-        return "转录完成，但未检测到语音内容（视频可能没有人声）。"
+        return f"{_platform_label(platform)} 转录完成，但未检测到语音内容（视频可能没有人声）。"
 
     return transcript
 
 
 @mcp.tool()
+async def analyze_video(url: str, model_size: str = WHISPER_MODEL) -> str:
+    """
+    通用视频转文字：支持抖音和 Bilibili 链接，返回 Whisper 文字稿。
+    参数同 analyze_douyin。
+    """
+    return await analyze_douyin(url, model_size)
+
+
+@mcp.tool()
 async def download_douyin(url: str) -> str:
     """
-    只下载抖音视频（无水印，最高画质），返回本地文件路径。
+    下载抖音/Bilibili 视频，返回本地文件路径。
     文件保存在系统临时目录，不会自动清理，请手动删除。
 
-    url: 抖音分享链接或App分享文本（自动提取URL）。
+    url: 抖音或 Bilibili 分享链接/分享文本（自动提取URL）。
     """
     try:
-        real_url = _extract_url(url)
+        out_path, _, _ = await _download_video_async(url)
     except ValueError as e:
         return str(e)
-
-    loop = asyncio.get_event_loop()
-
-    try:
-        video = await _get_video_object(real_url)
-    except RuntimeError as e:
-        return f"获取视频信息失败: {e}"
-
-    try:
-        dl_url = _pick_url_for_download(video)
-    except RuntimeError as e:
-        return f"下载失败: {e}"
-
-    out_dir = tempfile.mkdtemp(prefix="douyin_dl_")
-    out_path = os.path.join(out_dir, "video.mp4")
-    try:
-        await loop.run_in_executor(_EXECUTOR, _download_sync, dl_url, out_path)
     except Exception as e:
         return f"下载失败: {e}"
 
     return out_path
+
+
+@mcp.tool()
+async def download_video(url: str) -> str:
+    """
+    通用视频下载：支持抖音和 Bilibili 链接，返回本地文件路径。
+    参数同 download_douyin。
+    """
+    return await download_douyin(url)
 
 
 # ── 异步任务模式（用于 Claude Desktop 等硬超时客户端）─────
@@ -318,7 +566,7 @@ def _gc_jobs():
 
 
 async def _full_pipeline_bg(job_id: str, url: str, model_size: str) -> None:
-    """后台跑完整流程：URL 提取 → Playwright → 下载 → 转录。"""
+    """后台跑完整流程：URL 提取 → 下载 → 转录。"""
     job = _JOBS[job_id]
     loop = asyncio.get_event_loop()
     tmp_dir = None
@@ -326,26 +574,19 @@ async def _full_pipeline_bg(job_id: str, url: str, model_size: str) -> None:
         job["stage"] = "extracting_url"
         real_url = _extract_url(url)
 
-        job["stage"] = "fetching_metadata"
-        video = await _get_video_object(real_url)
-
-        job["stage"] = "picking_url"
-        dl_url = _pick_url_for_transcription(video)
-
         tmp_dir = tempfile.mkdtemp(prefix="douyin_job_")
-        out_path = os.path.join(tmp_dir, "video.mp4")
 
         job["stage"] = "downloading"
-        await loop.run_in_executor(_EXECUTOR, _download_sync, dl_url, out_path)
+        media_path, platform = await _download_transcription_media(real_url, tmp_dir)
 
         job["stage"] = "transcribing"
         text = await loop.run_in_executor(
-            _EXECUTOR, _transcribe_sync, out_path, model_size
+            _EXECUTOR, _transcribe_sync, media_path, model_size
         )
 
         job["status"] = "done"
         job["stage"] = "done"
-        job["result"] = text or "（未检测到语音内容）"
+        job["result"] = text or f"（{_platform_label(platform)} 未检测到语音内容）"
     except Exception as e:
         job["status"] = "error"
         job["result"] = f"{type(e).__name__}: {e}"
@@ -367,16 +608,16 @@ async def _full_pipeline_bg(job_id: str, url: str, model_size: str) -> None:
 @mcp.tool()
 async def douyin_to_text(url: str, model_size: str = WHISPER_MODEL) -> str:
     """
-    【推荐 Claude Desktop 使用】抖音视频转文字（异步）。
+    【推荐 Claude Desktop 使用】抖音/Bilibili 视频转文字（异步）。
     立即返回 job_id（<1秒），后台执行下载+转录。
     随后请调用 get_transcript_result(job_id) 取结果（该工具会等待最多 25 秒，未完成请再次调用）。
 
     适用场景：Claude Desktop chat 等客户端 MCP 工具调用有硬超时（约 30-60 秒），
     无法承受完整流程（25-90 秒）的同步调用。
 
-    url: 抖音分享链接或App分享文本（自动提取URL）。
-         支持: https://v.douyin.com/xxx/ 或 https://www.douyin.com/video/xxx
-               或 "5.33 复制打开抖音... https://v.douyin.com/xxx/" 整段分享文本
+    url: 抖音或 Bilibili 分享链接/分享文本（自动提取URL）。
+         支持: https://v.douyin.com/xxx/、https://www.douyin.com/video/xxx、
+               https://www.bilibili.com/video/BV... 或整段分享文本
     model_size: Whisper 模型，默认 "tiny"（快）。准度不够时改 "small"。
     """
     _gc_jobs()
@@ -393,6 +634,15 @@ async def douyin_to_text(url: str, model_size: str = WHISPER_MODEL) -> str:
         f"请调用 get_transcript_result(\"{job_id}\") 获取文字稿。"
         f"该工具会等待最多 25 秒，若未完成请再次调用同一个 job_id。"
     )
+
+
+@mcp.tool()
+async def video_to_text(url: str, model_size: str = WHISPER_MODEL) -> str:
+    """
+    通用异步视频转文字：支持抖音和 Bilibili，返回 job_id。
+    参数同 douyin_to_text。
+    """
+    return await douyin_to_text(url, model_size)
 
 
 @mcp.tool()
@@ -441,7 +691,7 @@ async def get_transcript_result(job_id: str, wait_seconds: float = 25.0) -> str:
 async def transcribe_video(file_path: str, model_size: str = WHISPER_MODEL) -> str:
     """
     转录本地视频或音频文件，返回文字稿。
-    使用 faster-whisper（默认 tiny 模型，中文）。
+    使用 faster-whisper（默认 tiny 模型，自动识别语言）。
 
     file_path: 本地视频/音频文件的绝对路径。
     model_size: Whisper 模型大小，默认 "tiny"。准度不够时可改为 "small"。

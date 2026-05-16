@@ -1,7 +1,7 @@
-# 抖音视频转文字 / Douyin to Text
+# 抖音 / Bilibili 视频转文字
 
-> 粘贴抖音分享链接 → 自动下载视频 → 用 Whisper 转录为文字稿。
-> 一步完成，无需手动跑两个网站。
+> 粘贴抖音或 Bilibili 链接，自动下载媒体，用本地 Whisper 转成文字稿。
+> 也可以只下载原视频到本机。
 
 [English](#english) | [中文](#中文)
 
@@ -11,45 +11,81 @@
 
 ### 这是什么？
 
-像 [yt-dlp](https://github.com/yt-dlp/yt-dlp) 或市面上各种"抖音视频解析下载"在线工具一样可以拿到视频，
-**但额外多了一步**：自动用本地 Whisper 模型转录出语音文字。
+这个项目适合这样的日常流程：
 
-适合这种场景：朋友扔过来一条抖音链接 → 你只想要文字内容 → 复制粘贴给 Claude / GPT / Grok / Gemini 做摘要、翻译、分析。
+1. 别人发来一条抖音或 Bilibili 视频链接。
+2. 你不想完整看视频，只想要里面说了什么。
+3. 打开本地网页，把链接粘进去。
+4. 点击“开始转录”，拿到文字稿。
+5. 把文字稿发给 Claude / GPT / Gemini 做摘要、翻译、分析，或者自己快速阅读。
 
-### 三种使用方式
+支持：
 
-| 方式 | 适合谁 | 怎么跑 |
-|------|--------|--------|
-| **网页 UI** | 不写代码的普通用户 | `python app.py`，浏览器打开 `127.0.0.1:7860` |
-| **MCP server** | Claude Desktop / Claude Code 用户 | 配进 MCP，对 AI 直接说"分析这条抖音" |
-| **Python 库** | 想集成到自己脚本 | `from server import _get_video_object, _transcribe_sync` |
+- 抖音短链：`https://v.douyin.com/.../`
+- 抖音长链：`https://www.douyin.com/video/...`
+- 抖音 App 整段分享文本
+- Bilibili 视频：`https://www.bilibili.com/video/BV...`
+- Bilibili 短链：`https://b23.tv/...`（由 `yt-dlp` 解析）
 
-### 快速开始
+### 界面里能做什么？
 
-```bash
-# 1. 克隆
-git clone https://github.com/ZY-ZhichaoYu/douyin-transcribe.git
-cd douyin-transcribe
+打开网页后主要有两个操作：
 
-# 2. 装依赖（建议用虚拟环境）
+- **开始转录**：下载适合转录的音频/视频流，然后用 `faster-whisper` 生成文字稿。
+- **下载视频**：只下载原视频，不转文字。抖音会下载可用 MP4；Bilibili 会用 `yt-dlp` 下载视频流和音频流并合并成 MP4。
+
+默认模型是 `base`。如果只想快速看大意，可以选 `tiny`；如果要更干净的文字稿，选 `small` 或 `medium`。
+
+### 如果你本地已经有这个项目
+
+Windows PowerShell：
+
+```powershell
+Set-Location E:\ZY_Work_from_20260402\GitHub\douyin-transcribe
+
+git pull
+python -m pip install --upgrade pip
 pip install -r requirements.txt
 playwright install chromium
 
-# 3a. 跑网页 UI
 python app.py
-# 然后浏览器打开 http://127.0.0.1:7860
-
-# 3b. 或作为 MCP server 使用（见下文 MCP 配置章节）
-python server.py
 ```
 
-第一次运行会自动下载 Whisper `tiny` 模型（~39MB）。
+然后打开：
 
-### 常规开始（推荐）
+```text
+http://127.0.0.1:7860
+```
 
-如果你是第一次在本机跑 Python 项目，建议按下面的完整流程来，避免依赖污染到系统 Python。
+注意：运行 `python app.py` 的终端窗口要保持打开。关掉终端，本地网页服务也会停止。
 
-#### Windows PowerShell
+### 快捷启动
+
+本仓库带了两个快捷启动脚本：
+
+```text
+run_web.bat
+run_web.ps1
+```
+
+最简单的方式是在资源管理器里双击 `run_web.bat`。它会进入项目目录，如果发现 `.venv` 虚拟环境就自动启用，然后运行 `python app.py`。
+
+PowerShell 方式：
+
+```powershell
+Set-Location E:\ZY_Work_from_20260402\GitHub\douyin-transcribe
+.\run_web.ps1
+```
+
+如果 PowerShell 提示脚本执行策略限制，可以先用普通方式：
+
+```powershell
+python app.py
+```
+
+### 第一次全新安装
+
+如果这台电脑上还没有仓库：
 
 ```powershell
 git clone https://github.com/ZY-ZhichaoYu/douyin-transcribe.git
@@ -65,45 +101,64 @@ playwright install chromium
 python app.py
 ```
 
-看到类似下面的输出就说明服务启动成功：
+第一次转录会自动下载 Whisper 模型：
 
-```text
-Running on local URL: http://127.0.0.1:7860
+- Web UI 默认 `base`，约 74MB。
+- MCP 工具默认 `tiny`，约 39MB，便于更快返回。
+
+### 常用操作
+
+#### 抖音转文字
+
+1. 复制抖音 App 分享文本，整段都可以。
+2. 粘贴到“视频链接 / 分享文本”。
+3. 模型默认 `base`。
+4. 点击“开始转录”。
+5. 右侧“文字稿（可复制）”出现结果后，复制给 AI 或自己阅读。
+
+#### Bilibili 转文字
+
+1. 复制 Bilibili 视频链接，例如 `https://www.bilibili.com/video/BV...`。
+2. 粘贴到同一个输入框。
+3. 点击“开始转录”。
+
+Bilibili 转录会优先下载音频流，速度通常比下载完整视频更快。
+
+#### 下载视频
+
+在“转文字”页或“仅下载视频”页都可以点“下载视频 / 下载（最高画质）”。
+
+下载完成后会看到：
+
+- 浏览器里的下载文件控件。
+- 本地文件路径，例如 `C:\Users\...\AppData\Local\Temp\video_dl_xxx\xxx.mp4`。
+
+文件保存在系统临时目录，不会立刻自动删除；需要长期保存时，可以把它移动到自己的视频目录。
+
+### 依赖说明
+
+核心依赖：
+
+- `playwright`：抖音页面抓取和接口拦截。
+- `yt-dlp`：Bilibili 下载和格式解析。
+- `ffmpeg`：Bilibili 视频流 + 音频流合并成 MP4 时需要。
+- `faster-whisper`：本地语音识别。
+- `gradio`：本地网页界面。
+
+检查依赖：
+
+```powershell
+python -c "import gradio, playwright, faster_whisper, yt_dlp; print('ok')"
+ffmpeg -version
 ```
 
-然后打开浏览器访问 [http://127.0.0.1:7860](http://127.0.0.1:7860)，粘贴抖音分享链接或整段分享文本即可。运行 `python app.py` 的终端窗口不要关闭；关闭后本地网页服务也会停止。
+如果 `ffmpeg -version` 不存在，Bilibili 转文字通常仍可工作，因为它只下载音频；但 Bilibili “下载视频”可能无法把视频流和音频流合并成一个 MP4。Windows 可以安装 Gyan.dev 或 `winget install Gyan.FFmpeg`。
 
-#### macOS / Linux
+### MCP 用法
 
-```bash
-git clone https://github.com/ZY-ZhichaoYu/douyin-transcribe.git
-cd douyin-transcribe
+`server.py` 仍然可以作为 MCP server 使用。
 
-python3 -m venv .venv
-source .venv/bin/activate
-
-python -m pip install --upgrade pip
-pip install -r requirements.txt
-playwright install chromium
-
-python app.py
-```
-
-#### 验证安装
-
-可以用下面的命令确认核心依赖可导入：
-
-```bash
-python -c "import gradio, playwright, faster_whisper; print('ok')"
-```
-
-如果网页打不开，先看终端里 `python app.py` 是否还在运行。浏览器显示 `127.0.0.1 refused to connect` 通常表示本地服务没有启动成功，而不是浏览器问题。
-
-### MCP 配置
-
-#### Claude Desktop
-
-编辑 `%APPDATA%\Claude\claude_desktop_config.json`：
+Claude Desktop 配置示例：
 
 ```json
 {
@@ -116,256 +171,144 @@ python -c "import gradio, playwright, faster_whisper; print('ok')"
 }
 ```
 
-#### Claude Code
+可用工具：
 
-```bash
-claude mcp add douyin -s user python /path/to/douyin-transcribe/server.py
-```
-
-并建议在 `~/.claude/settings.json` 里加：
-
-```json
-{
-  "env": {
-    "MCP_TOOL_TIMEOUT": "120000"
-  }
-}
-```
-
-### 工具清单（MCP）
-
-| 工具 | 用途 | 推荐场景 |
-|------|------|----------|
-| `analyze_douyin(url)` | 同步：下载+转录，一次返回文字稿 (~25s) | Claude Code |
-| `douyin_to_text(url)` | 异步：立即返回 `job_id`，后台干活 | **Claude Desktop**（避超时） |
-| `get_transcript_result(job_id)` | 取异步任务结果（最多等 25 秒） | 配合 `douyin_to_text` 使用 |
-| `download_douyin(url)` | 仅下载视频（最高画质） | 想保留原视频 |
-| `transcribe_video(file_path)` | 转录本地视频/音频文件 | 本地已有视频 |
-
-### 性能与精度
-
-实测一段 4 分钟的财经口播视频（i5 笔记本，CPU）：
-
-| 阶段 | 耗时 |
+| 工具 | 用途 |
 |------|------|
-| Playwright 拦截 CDN URL | ~10s |
-| 下载（自动选低码率，~20MB） | ~6s |
-| Whisper `tiny` 转录 | ~7s |
-| **合计** | **~25s** |
+| `analyze_video(url)` | 通用同步转录，支持抖音和 Bilibili |
+| `video_to_text(url)` | 通用异步转录，返回 `job_id` |
+| `get_transcript_result(job_id)` | 获取异步任务结果 |
+| `download_video(url)` | 通用下载视频，支持抖音和 Bilibili |
+| `transcribe_video(file_path)` | 转录本地视频或音频文件 |
+| `analyze_douyin(url)` | 兼容旧工具名，现在也可处理 Bilibili |
+| `douyin_to_text(url)` | 兼容旧工具名，现在也可处理 Bilibili |
+| `download_douyin(url)` | 兼容旧工具名，现在也可处理 Bilibili |
 
-精度参考：
+如果 MCP 客户端容易超时，优先用异步流程：
 
-- `tiny` (39MB)：核心意思 OK，专有名词同音字偶有错误（"白酒"→"通车"），适合摘要、要点提取
-- `small` (244MB)：~80s 左右，准度明显提升，适合需要精确文字的场景
-- `medium` (1.5GB)：~3 分钟，几乎逐字准确，适合长视频字幕
-
-切换模型：`analyze_douyin(url, model_size="small")`
+1. 调 `video_to_text(url)`，拿到 `job_id`。
+2. 调 `get_transcript_result(job_id)`，没完成就隔一会儿再调同一个 `job_id`。
 
 ### 技术原理
 
-抖音视频下载的难点不是带宽，是 **cookie**：直接 `requests.get(video_url)` 会被反爬挡掉，
-yt-dlp 需要从浏览器导出 `s_v_web_id` cookie，但 Chrome/Edge 的 SQLite 文件常被 WebView2 锁住，导不出。
+抖音：
 
-本项目的解法：**用 headless Chromium 自己充当浏览器**，让抖音的 JS 自然跑起来生成 cookie，
-拦截 `aweme/v1/web/aweme/detail` 这条 API 响应，从中取出无水印 CDN 直链（`zjcdn.com`），
-然后 urllib 下载。整个过程不依赖系统 cookie。
+- 用 headless Chromium 打开页面。
+- 拦截 `aweme/v1/web/aweme/detail` 接口。
+- 转录时优先使用 `bit_rate_audio` 音频流，没有音频流时回退到带音频的 MP4。
 
-转录用 [faster-whisper](https://github.com/SYSTRAN/faster-whisper)，
-比官方 openai-whisper 快 4 倍且占内存少。
+Bilibili：
+
+- 用 `yt-dlp` 提取视频信息和直链。
+- 转录时优先下载音频流。
+- 下载视频时使用 `bv*[ext=mp4]+ba[ext=m4a]/bv*+ba/b`，并让 ffmpeg 合并成 MP4。
+
+Whisper：
+
+- 语言自动识别，适合中文、英文或中英混杂视频。
+- 默认 CPU + int8，速度优先，不需要显卡。
 
 ### 已知限制
 
-- 只测试了**单视频**链接，**图集/合集/直播回放**未测试
-- 中文语音识别效果取决于模型大小和音频质量；背景音乐大、多人重叠时准度下降
-- 不支持需要登录才能看的私密视频
-- 抖音改 API 路径会失效（截至 2026-05 工作正常）
+- 主要测试单视频链接。合集、图集、直播回放不保证。
+- Bilibili 未登录时通常只能拿到游客可看的清晰度；1080P、4K、会员视频需要 cookies，本项目暂未做登录/cookies 导入界面。
+- 抖音或 Bilibili 修改网页接口时，抓取可能失效，需要更新代码或 `yt-dlp`。
+- 语音识别质量取决于音频质量、背景音乐、多人重叠、模型大小。
 
 ### 常见问题
 
-**Q: Playwright 报 "Executable doesn't exist"？**
-A: 跑一次 `playwright install chromium`。
+**Q: 打开 `127.0.0.1:7860` 显示 refused to connect？**
+A: 本地服务没跑。先在项目目录执行 `python app.py`，并保持终端打开。
 
-**Q: faster-whisper 报 CUDA 错误？**
-A: 默认配置是 CPU (`device="cpu", compute_type="int8"`)，不需要 GPU。如果你装了 CUDA 想加速，把 `_transcribe_sync` 里的 `device` 改 `"cuda"`。
+**Q: Playwright 报 browser executable 不存在？**
+A: 执行：
 
-**Q: faster-whisper / PyAV 报 `tuple index out of range`？**
-A: 通常是拿到了只有视频、没有音频的 DASH 分片。本项目现在转录时会优先选择普通 MP4 候选，以避免这个问题。如果仍遇到，请先更新到最新代码。
+```powershell
+playwright install chromium
+```
 
-**Q: Claude Desktop 调用工具一直超时？**
-A: 用 `douyin_to_text` 而不是 `analyze_douyin`，前者立即返回 job_id，规避超时。
+**Q: Bilibili 下载视频失败，但转文字可以？**
+A: 多数是没有 ffmpeg，导致视频流和音频流不能合并。执行 `ffmpeg -version` 检查。
+
+**Q: 转录结果错字很多？**
+A: 先把模型从 `tiny` 或 `base` 调到 `small`。财经、技术、英文夹杂视频建议至少用 `base` 或 `small`。
+
+**Q: 为什么下载的视频在 Temp 目录？**
+A: 这是为了不污染项目目录。下载完成后界面会显示本地路径，需要长期保存时手动移动即可。
 
 ### 致谢
 
-- [Playwright](https://playwright.dev/) — headless browser
-- [faster-whisper](https://github.com/SYSTRAN/faster-whisper) — 语音识别
-- [Gradio](https://www.gradio.app/) — Web UI
-- [Model Context Protocol](https://modelcontextprotocol.io/) — Claude 的工具协议
+- [Playwright](https://playwright.dev/)
+- [yt-dlp](https://github.com/yt-dlp/yt-dlp)
+- [faster-whisper](https://github.com/SYSTRAN/faster-whisper)
+- [Gradio](https://www.gradio.app/)
+- [Model Context Protocol](https://modelcontextprotocol.io/)
 
 ### 许可证
 
-MIT License — 详见 [LICENSE](./LICENSE)
+MIT License，见 [LICENSE](./LICENSE)。
 
 ---
 
 ## English
 
-### What is this?
+### What Is This?
 
-Douyin to Text downloads a Douyin (Chinese TikTok) video from a share link and
-transcribes the speech locally with Whisper.
+This is a local web app and MCP server that turns Douyin or Bilibili videos into text.
+Paste a video URL, download the media locally, transcribe it with faster-whisper, then copy the transcript into an AI model for summary or analysis.
 
-Paste a Douyin share URL, or the full share text copied from the Douyin app, and
-get a transcript that you can send to Claude, ChatGPT, Gemini, or another LLM
-for summary, translation, note taking, or analysis.
+Supported inputs:
 
-### Features
-
-- Web UI for non-technical users, powered by Gradio
-- MCP server for Claude Desktop / Claude Code
-- Local transcription with faster-whisper
-- No browser cookie export required
-- Supports plain Douyin URLs and full app share text
-- Automatically avoids DASH video-only streams when selecting a file for transcription
-
-### Why not yt-dlp?
-
-yt-dlp needs a fresh `s_v_web_id` cookie from douyin.com, which on Windows
-gets locked by WebView2 even when the browser is closed.
-This tool uses headless Chromium instead, so the cookie is generated on-the-fly
-and never needs to be exported from the host browser.
+- Douyin short links: `https://v.douyin.com/.../`
+- Douyin video URLs: `https://www.douyin.com/video/...`
+- Full Douyin app share text
+- Bilibili BV URLs: `https://www.bilibili.com/video/BV...`
+- Bilibili short links: `https://b23.tv/...`
 
 ### Quick Start
 
-```bash
-git clone https://github.com/ZY-ZhichaoYu/douyin-transcribe.git
-cd douyin-transcribe
-pip install -r requirements.txt
-playwright install chromium
-
-# Web UI:
-python app.py        # then open http://127.0.0.1:7860
-
-# Or as MCP server (for Claude Desktop / Code):
-python server.py
-```
-
-The first run downloads the default Whisper `tiny` model.
-
-### Standard Setup
-
-Use a virtual environment if you want a cleaner local install.
-
-#### Windows PowerShell
+If you already have the repo locally:
 
 ```powershell
-git clone https://github.com/ZY-ZhichaoYu/douyin-transcribe.git
-cd douyin-transcribe
-
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-
-python -m pip install --upgrade pip
+Set-Location E:\ZY_Work_from_20260402\GitHub\douyin-transcribe
+git pull
 pip install -r requirements.txt
 playwright install chromium
-
 python app.py
 ```
 
-Open [http://127.0.0.1:7860](http://127.0.0.1:7860), paste a Douyin link, and start transcription.
+Then open:
 
-#### macOS / Linux
-
-```bash
-git clone https://github.com/ZY-ZhichaoYu/douyin-transcribe.git
-cd douyin-transcribe
-
-python3 -m venv .venv
-source .venv/bin/activate
-
-python -m pip install --upgrade pip
-pip install -r requirements.txt
-playwright install chromium
-
-python app.py
+```text
+http://127.0.0.1:7860
 ```
 
-### MCP Setup
+Keep the `python app.py` terminal open while using the web UI.
 
-#### Claude Desktop
+You can also double-click `run_web.bat` on Windows.
 
-Edit `%APPDATA%\Claude\claude_desktop_config.json` on Windows, or the equivalent Claude Desktop config file on macOS:
+### Dependencies
 
-```json
-{
-  "mcpServers": {
-    "douyin": {
-      "command": "python",
-      "args": ["C:\\path\\to\\douyin-transcribe\\server.py"]
-    }
-  }
-}
-```
-
-#### Claude Code
-
-```bash
-claude mcp add douyin -s user python /path/to/douyin-transcribe/server.py
-```
-
-If your client has a short MCP timeout, prefer the asynchronous workflow:
-
-1. Call `douyin_to_text(url)` and keep the returned `job_id`.
-2. Call `get_transcript_result(job_id)` until the transcript is ready.
+- Playwright for Douyin browser capture
+- yt-dlp for Bilibili extraction and download
+- ffmpeg for merging Bilibili video and audio into MP4
+- faster-whisper for local transcription
+- Gradio for the web UI
 
 ### MCP Tools
 
 | Tool | Purpose |
 |------|---------|
-| `analyze_douyin(url)` | Synchronous download and transcription |
-| `douyin_to_text(url)` | Start an asynchronous background transcription job |
-| `get_transcript_result(job_id)` | Poll an asynchronous transcription job |
-| `download_douyin(url)` | Download the source video only |
-| `transcribe_video(file_path)` | Transcribe a local video or audio file |
+| `analyze_video(url)` | Synchronous transcript for Douyin or Bilibili |
+| `video_to_text(url)` | Start async transcription and return a job id |
+| `get_transcript_result(job_id)` | Poll async transcription result |
+| `download_video(url)` | Download source video |
+| `transcribe_video(file_path)` | Transcribe a local media file |
 
-### Model Choice
+Legacy tool names (`analyze_douyin`, `douyin_to_text`, `download_douyin`) are kept for compatibility.
 
-The default model is `tiny`, which is fast and good enough for summaries. Use
-`small` or `medium` when you need cleaner text:
+### Notes
 
-```python
-analyze_douyin(url, model_size="small")
-```
-
-Available model names include `tiny`, `base`, `small`, `medium`, and `large-v3`.
-
-### Troubleshooting
-
-**`127.0.0.1 refused to connect`**
-
-The local Gradio service is not running. Start it with `python app.py` and keep
-that terminal open.
-
-**Playwright says the browser executable does not exist**
-
-Run:
-
-```bash
-playwright install chromium
-```
-
-**Transcription fails with `tuple index out of range`**
-
-This usually means the selected video file has no audio stream. Update to the
-latest code; transcription now prefers progressive MP4 streams and avoids DASH
-video-only fragments.
-
-### Limitations
-
-- Tested mainly with single-video Douyin links
-- Private or login-only videos are not supported
-- Speech recognition accuracy depends on audio quality and model size
-- Douyin may change its web APIs, which can break metadata extraction
-
-### License
+Bilibili downloads use yt-dlp. Guest access may only expose lower resolutions; premium or login-only formats need cookies, which this UI does not manage yet.
 
 MIT License. See [LICENSE](./LICENSE).
