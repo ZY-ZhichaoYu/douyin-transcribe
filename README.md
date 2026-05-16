@@ -35,6 +35,7 @@
 - **下载视频**：只下载原视频，不转文字。抖音会下载可用 MP4；Bilibili 会用 `yt-dlp` 下载视频流和音频流并合并成 MP4。
 
 默认模型是 `base`。如果只想快速看大意，可以选 `tiny`；如果要更干净的文字稿，选 `small` 或 `medium`。
+注意：十几二十分钟的长视频在 CPU 上转录会明显变慢，尤其是 `medium`。日常使用建议先用 `base` 或 `small`，只有对准确率要求很高时再用 `medium`。
 
 ### 如果你本地已经有这个项目
 
@@ -58,6 +59,7 @@ http://127.0.0.1:7860
 ```
 
 注意：运行 `python app.py` 的终端窗口要保持打开。关掉终端，本地网页服务也会停止。
+如果 `7860` 端口已经被占用，程序会自动尝试 `7861`、`7862` 等后续端口，并在终端里打印实际地址。
 
 ### 快捷启动
 
@@ -195,6 +197,7 @@ Claude Desktop 配置示例：
 
 - 用 headless Chromium 打开页面。
 - 拦截 `aweme/v1/web/aweme/detail` 接口。
+- 如果浏览器没有拦截到接口，会回退到移动端分享页里的 `window._ROUTER_DATA` 解析，减少短链偶发失败。
 - 转录时优先使用 `bit_rate_audio` 音频流，没有音频流时回退到带音频的 MP4。
 
 Bilibili：
@@ -219,6 +222,16 @@ Whisper：
 
 **Q: 打开 `127.0.0.1:7860` 显示 refused to connect？**
 A: 本地服务没跑。先在项目目录执行 `python app.py`，并保持终端打开。
+
+**Q: 运行时报 `Cannot find empty port in range: 7860-7860`？**
+A: 旧版本会固定占用 `7860`。更新后请先 `git pull`，再重新运行 `python app.py`；如果 `7860` 被占用，程序会自动换到下一个可用端口。也可以手动指定：
+```powershell
+$env:GRADIO_SERVER_PORT = "7861"
+python app.py
+```
+
+**Q: 进度条停在转录中，是不是卡死了？**
+A: 不一定。下载完成后进入 Whisper 转录，CPU 上处理长视频会很慢，`medium` 最慢。20 分钟视频建议先用 `base` 或 `small`，确认内容够用后再考虑 `medium`。
 
 **Q: Playwright 报 browser executable 不存在？**
 A: 执行：
@@ -284,6 +297,7 @@ http://127.0.0.1:7860
 ```
 
 Keep the `python app.py` terminal open while using the web UI.
+If port `7860` is already busy, the app will automatically try the next available port and print the actual local URL in the terminal.
 
 You can also double-click `run_web.bat` on Windows.
 
@@ -308,6 +322,10 @@ You can also double-click `run_web.bat` on Windows.
 Legacy tool names (`analyze_douyin`, `douyin_to_text`, `download_douyin`) are kept for compatibility.
 
 ### Notes
+
+For long videos on CPU, `medium` can take a long time. Start with `base` or `small` for everyday use, then rerun with `medium` only when you need the extra accuracy.
+
+Douyin extraction first tries the browser-captured detail API. If that fails, it falls back to parsing `window._ROUTER_DATA` from the mobile share page.
 
 Bilibili downloads use yt-dlp. Guest access may only expose lower resolutions; premium or login-only formats need cookies, which this UI does not manage yet.
 

@@ -18,6 +18,7 @@ Architecture:
 """
 
 import asyncio
+import json
 import os
 import re
 import ssl
@@ -40,12 +41,18 @@ _UA = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/120.0.0.0 Safari/537.36"
 )
+_MOBILE_UA = (
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) "
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+    "Version/16.0 Mobile/15E148 Safari/604.1"
+)
 _SSL_CTX = ssl.create_default_context()
 _SSL_CTX.check_hostname = False
 _SSL_CTX.verify_mode = ssl.CERT_NONE
 
-# 阻塞操作（urllib 下载、Whisper 转录）在此线程池运行
-_EXECUTOR = ThreadPoolExecutor(max_workers=1)
+# 下载和转录分开排队：长视频转录很慢，不能阻塞普通下载任务。
+_DOWNLOAD_EXECUTOR = ThreadPoolExecutor(max_workers=3)
+_TRANSCRIBE_EXECUTOR = ThreadPoolExecutor(max_workers=1)
 
 # Whisper 模型：tiny=39MB/快，small=244MB/更准。
 # 默认 tiny：抖音口播一般清晰，端到端 ~25s 可在 MCP 超时内完成。
@@ -155,6 +162,154 @@ async def _get_video_object(page_url: str) -> dict:
     raise RuntimeError(f"Playwright 未能拦截到视频信息，请稍后重试{suffix}")
 
 
+# ── 抖音分享页兜底：移动端 HTML 中的 window._ROUTER_DATA ─────
+
+def _read_url_text_sync(url: str, headers: dict | None = None, timeout: int = 30) -> tuple[str, str]:
+    request_headers = {
+        "User-Agent": _MOBILE_UA,
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "Referer": "https://www.douyin.com/",
+    }
+    if headers:
+        request_headers.update(headers)
+    req = urllib.request.Request(url, headers=request_headers)
+    with urllib.request.urlopen(req, context=_SSL_CTX, timeout=timeout) as resp:
+        raw = resp.read()
+        charset = resp.headers.get_content_charset() or "utf-8"
+        return raw.decode(charset, "replace"), resp.geturl()
+
+
+def _extract_json_object_after_marker(text: str, marker: str) -> dict:
+    marker_pos = text.find(marker)
+    if marker_pos < 0:
+        raise ValueError(f"未找到 {marker}")
+    start = text.find("{", marker_pos)
+    if start < 0:
+        raise ValueError(f"{marker} 后面没有 JSON 对象")
+
+    depth = 0
+    in_string = False
+    escaped = False
+    for idx, ch in enumerate(text[start:], start):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return json.loads(text[start:idx + 1])
+
+    raise ValueError(f"{marker} JSON 对象不完整")
+
+
+def _looks_like_douyin_video(value) -> bool:
+    return (
+        isinstance(value, dict)
+        and isinstance(value.get("play_addr"), dict)
+        and any(key in value for key in ("bit_rate", "duration", "cover"))
+    )
+
+
+def _find_douyin_video_dict(value) -> dict | None:
+    if isinstance(value, dict):
+        if _looks_like_douyin_video(value):
+            return value
+
+        aweme = value.get("aweme_detail")
+        if isinstance(aweme, dict) and _looks_like_douyin_video(aweme.get("video")):
+            return aweme["video"]
+
+        video = value.get("video")
+        if _looks_like_douyin_video(video):
+            return video
+
+        for child in value.values():
+            found = _find_douyin_video_dict(child)
+            if found:
+                return found
+    elif isinstance(value, list):
+        for child in value:
+            found = _find_douyin_video_dict(child)
+            if found:
+                return found
+    return None
+
+
+def _douyin_share_page_candidates(original_url: str, final_url: str) -> list[str]:
+    result = []
+
+    def add(url: str) -> None:
+        if url and url not in result:
+            result.append(url)
+
+    add(final_url)
+    add(original_url)
+
+    for url in (final_url, original_url):
+        match = re.search(r"/(?:share/)?video/(\d+)", url)
+        if not match:
+            continue
+        video_id = match.group(1)
+        add(f"https://www.iesdouyin.com/share/video/{video_id}/")
+        add(f"https://www.douyin.com/video/{video_id}")
+
+    return result
+
+
+def _get_video_object_from_share_page_sync(page_url: str) -> dict:
+    errors: list[str] = []
+    first_html = ""
+    final_url = page_url
+    try:
+        first_html, final_url = _read_url_text_sync(page_url)
+    except Exception as e:
+        errors.append(f"{page_url}: {type(e).__name__}")
+
+    fetched = {final_url: first_html} if first_html else {}
+    for candidate in _douyin_share_page_candidates(page_url, final_url):
+        try:
+            html = fetched.get(candidate)
+            if html is None:
+                html, _ = _read_url_text_sync(candidate)
+            data = _extract_json_object_after_marker(html, "window._ROUTER_DATA")
+            video = _find_douyin_video_dict(data)
+            if video:
+                return video
+            errors.append(f"{candidate}: 未找到 video 字段")
+        except Exception as e:
+            errors.append(f"{candidate}: {type(e).__name__}")
+
+    detail = "; ".join(errors[-3:]) if errors else "没有可解析的分享页"
+    raise RuntimeError(f"抖音分享页解析失败: {detail}")
+
+
+async def _get_douyin_video_object(page_url: str) -> dict:
+    loop = asyncio.get_running_loop()
+    try:
+        return await _get_video_object(page_url)
+    except Exception as e:
+        playwright_error = e
+
+    try:
+        return await loop.run_in_executor(
+            _DOWNLOAD_EXECUTOR, _get_video_object_from_share_page_sync, page_url
+        )
+    except Exception as e:
+        raise RuntimeError(
+            f"抖音视频信息获取失败: Playwright 拦截 {playwright_error}; 分享页解析 {e}"
+        ) from e
+
+
 # ── URL 选取（纯内存操作，无网络调用）────────────────────
 
 def _external_cdn_urls(urls) -> list[str]:
@@ -178,8 +333,12 @@ def _external_cdn_urls(urls) -> list[str]:
             continue
         if "douyin.com" in url:
             continue
-        if url not in result:
-            result.append(url)
+        candidates = [url]
+        if "/playwm/" in url:
+            candidates.insert(0, url.replace("/playwm/", "/play/"))
+        for candidate in candidates:
+            if candidate not in result:
+                result.append(candidate)
     return result
 
 
@@ -191,7 +350,7 @@ def _cdn_urls(item: dict) -> list[str]:
 def _sorted_audio_candidates(video: dict) -> list[tuple[int, int, str]]:
     """Return audio-only CDN candidates sorted by bitrate/size."""
     result = []
-    for item in video.get("bit_rate_audio", []):
+    for item in video.get("bit_rate_audio") or []:
         meta = item.get("audio_meta") or {}
         urls = _external_cdn_urls(meta.get("url_list") or {})
         if urls:
@@ -215,7 +374,7 @@ def _sorted_audio_candidates(video: dict) -> list[tuple[int, int, str]]:
 def _sorted_candidates(video: dict) -> list[tuple[int, str]]:
     """返回按码率升序排列的 (bit_rate, cdn_url) 列表。"""
     result = []
-    for item in video.get("bit_rate", []):
+    for item in video.get("bit_rate") or []:
         urls = _cdn_urls(item)
         if urls:
             result.append((item.get("bit_rate", 0), urls[0]))
@@ -226,7 +385,7 @@ def _sorted_candidates(video: dict) -> list[tuple[int, str]]:
 def _sorted_progressive_candidates(video: dict) -> list[tuple[int, str]]:
     """返回普通 MP4 候选；DASH 候选通常是纯视频分片，不适合直接给 Whisper。"""
     result = []
-    for item in video.get("bit_rate", []):
+    for item in video.get("bit_rate") or []:
         if item.get("format") != "mp4":
             continue
         urls = _cdn_urls(item)
@@ -252,8 +411,7 @@ def _pick_url_for_transcription(video: dict) -> str:
     if cands:
         return cands[0][1]
     # 回退
-    fallback = [u for u in video.get("play_addr", {}).get("url_list", [])
-                if "douyin.com" not in u]
+    fallback = _external_cdn_urls((video.get("play_addr") or {}).get("url_list", []))
     if fallback:
         return fallback[0]
     raise RuntimeError("无法找到可用的视频链接")
@@ -267,8 +425,7 @@ def _pick_url_for_download(video: dict) -> str:
     cands = _sorted_candidates(video)
     if cands:
         return cands[-1][1]  # 最高码率
-    fallback = [u for u in video.get("play_addr", {}).get("url_list", [])
-                if "douyin.com" not in u]
+    fallback = _external_cdn_urls((video.get("play_addr") or {}).get("url_list", []))
     if fallback:
         return fallback[0]
     raise RuntimeError("无法找到可用的视频链接")
@@ -452,14 +609,14 @@ async def _download_transcription_media(real_url: str, out_dir: str) -> tuple[st
     platform = _detect_platform(real_url)
     loop = asyncio.get_running_loop()
     if platform == "douyin":
-        video = await _get_video_object(real_url)
+        video = await _get_douyin_video_object(real_url)
         dl_url = _pick_url_for_transcription(video)
         out_path = os.path.join(out_dir, "douyin_media.mp4")
-        await loop.run_in_executor(_EXECUTOR, _download_sync, dl_url, out_path)
+        await loop.run_in_executor(_DOWNLOAD_EXECUTOR, _download_sync, dl_url, out_path)
         return out_path, platform
     if platform == "bilibili":
         out_path = await loop.run_in_executor(
-            _EXECUTOR, _download_bilibili_transcription_media_sync, real_url, out_dir
+            _DOWNLOAD_EXECUTOR, _download_bilibili_transcription_media_sync, real_url, out_dir
         )
         return out_path, platform
     raise ValueError(f"暂不支持这个平台: {platform}")
@@ -470,14 +627,14 @@ async def _download_video_file(real_url: str, out_dir: str) -> tuple[str, str]:
     platform = _detect_platform(real_url)
     loop = asyncio.get_running_loop()
     if platform == "douyin":
-        video = await _get_video_object(real_url)
+        video = await _get_douyin_video_object(real_url)
         dl_url = _pick_url_for_download(video)
         out_path = os.path.join(out_dir, "douyin_video.mp4")
-        await loop.run_in_executor(_EXECUTOR, _download_sync, dl_url, out_path)
+        await loop.run_in_executor(_DOWNLOAD_EXECUTOR, _download_sync, dl_url, out_path)
         return out_path, platform
     if platform == "bilibili":
         out_path = await loop.run_in_executor(
-            _EXECUTOR, _download_bilibili_video_sync, real_url, out_dir
+            _DOWNLOAD_EXECUTOR, _download_bilibili_video_sync, real_url, out_dir
         )
         return out_path, platform
     raise ValueError(f"暂不支持这个平台: {platform}")
@@ -491,7 +648,7 @@ async def _transcribe_url_async(url: str, model_size: str = WHISPER_MODEL) -> tu
         media_path, platform = await _download_transcription_media(real_url, tmp)
         size_mb = os.path.getsize(media_path) / 1024 / 1024
         transcript = await loop.run_in_executor(
-            _EXECUTOR, _transcribe_sync, media_path, model_size
+            _TRANSCRIBE_EXECUTOR, _transcribe_sync, media_path, model_size
         )
     return transcript, platform, size_mb
 
@@ -604,7 +761,7 @@ async def _full_pipeline_bg(job_id: str, url: str, model_size: str) -> None:
 
         job["stage"] = "transcribing"
         text = await loop.run_in_executor(
-            _EXECUTOR, _transcribe_sync, media_path, model_size
+            _TRANSCRIBE_EXECUTOR, _transcribe_sync, media_path, model_size
         )
 
         job["status"] = "done"
@@ -728,7 +885,7 @@ async def transcribe_video(file_path: str, model_size: str = WHISPER_MODEL) -> s
     loop = asyncio.get_event_loop()
     try:
         transcript = await loop.run_in_executor(
-            _EXECUTOR, _transcribe_sync, str(path), model_size
+            _TRANSCRIBE_EXECUTOR, _transcribe_sync, str(path), model_size
         )
     except Exception as e:
         return f"转录失败: {e}"
