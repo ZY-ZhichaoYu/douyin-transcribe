@@ -34,25 +34,45 @@
 打开网页后主要有两个操作：
 
 - **开始转录**：下载适合转录的音频/视频流，然后用 `faster-whisper` 生成文字稿。
-- **下载视频**：只下载原视频，不转文字。抖音会下载可用 MP4；Bilibili 会用 `yt-dlp` 下载视频流和音频流并合并成 MP4。
+- **下载视频**：只下载原视频，不转文字。抖音会下载可用 MP4；Bilibili 会优先下载 H.264/AVC 视频流和音频流并合并成 MP4。
 
 默认模型是 `base`。如果只想快速看大意，可以选 `tiny`；如果要更干净的文字稿，选 `small` 或 `medium`。
 注意：十几二十分钟的长视频在 CPU 上转录会明显变慢，尤其是 `medium`。日常使用建议先用 `base` 或 `small`，只有对准确率要求很高时再用 `medium`。
 
+### 运行前准备
+
+Windows 用户建议先确认这些基础条件：
+
+```powershell
+python --version
+git --version
+```
+
+需要：
+
+- Python 3.10 或更新版本（建议 64 位 Python）。
+- Git，用来下载或更新仓库。
+- 第一次运行需要联网下载 Python 依赖、Playwright Chromium 和 Whisper 模型。
+- 只“转文字”通常不需要手动安装 ffmpeg；如果要下载 Bilibili 完整 MP4，建议安装 ffmpeg：`winget install Gyan.FFmpeg`。
+
 ### 如果你本地已经有这个项目
 
-Windows PowerShell：
+最稳的方式是在资源管理器里双击 `run_web.bat`。它会自动创建 `.venv`、安装依赖、安装 Playwright Chromium，然后启动网页。
+
+如果你想手动运行，Windows PowerShell 用下面这组命令。注意：这里不需要执行 `Activate.ps1`，可以避开 PowerShell 执行策略问题。
 
 ```powershell
 Set-Location C:\path\to\douyin-transcribe
 # 例如本机：Set-Location E:\ZY_Work_from_20260402\GitHub\douyin-transcribe
 
 git pull
-python -m pip install --upgrade pip
-python -m pip install --upgrade -r requirements.txt
-python -m playwright install chromium
+if (!(Test-Path .\.venv\Scripts\python.exe)) { python -m venv .venv }
 
-python app.py
+.\.venv\Scripts\python.exe -m pip install --upgrade pip
+.\.venv\Scripts\python.exe -m pip install --upgrade -r requirements.txt
+.\.venv\Scripts\python.exe -m playwright install chromium
+
+.\.venv\Scripts\python.exe app.py
 ```
 
 然后打开：
@@ -61,7 +81,7 @@ python app.py
 http://127.0.0.1:7860
 ```
 
-注意：运行 `python app.py` 的终端窗口要保持打开。关掉终端，本地网页服务也会停止。
+注意：运行 `app.py` 的终端窗口要保持打开。关掉终端，本地网页服务也会停止。
 如果 `7860` 端口已经被占用，程序会自动尝试 `7861`、`7862` 等后续端口，并在终端里打印实际地址。
 
 ### 快捷启动
@@ -73,7 +93,7 @@ run_web.bat
 run_web.ps1
 ```
 
-最简单的方式是在资源管理器里双击 `run_web.bat`。它会进入项目目录，自动创建 `.venv`，补齐 Python 依赖，安装 Playwright Chromium，然后运行 `python app.py`。
+最简单的方式是在资源管理器里双击 `run_web.bat`。它会进入项目目录，自动创建 `.venv`，补齐 Python 依赖，安装 Playwright Chromium，然后启动本地网页服务。
 第一次运行需要联网下载依赖和浏览器内核，时间会比较久；后续再启动会快很多。
 
 PowerShell 方式：
@@ -83,10 +103,10 @@ Set-Location C:\path\to\douyin-transcribe
 .\run_web.ps1
 ```
 
-如果 PowerShell 提示脚本执行策略限制，可以先用普通方式：
+如果 PowerShell 提示脚本执行策略限制，改用下面这个命令，或直接双击 `run_web.bat`：
 
 ```powershell
-python app.py
+powershell -ExecutionPolicy Bypass -File .\run_web.ps1
 ```
 
 ### 第一次全新安装
@@ -98,14 +118,14 @@ git clone https://github.com/ZY-ZhichaoYu/douyin-transcribe.git
 cd douyin-transcribe
 
 python -m venv .venv
-.\.venv\Scripts\Activate.ps1
+.\.venv\Scripts\python.exe -m pip install --upgrade pip
+.\.venv\Scripts\python.exe -m pip install --upgrade -r requirements.txt
+.\.venv\Scripts\python.exe -m playwright install chromium
 
-python -m pip install --upgrade pip
-python -m pip install --upgrade -r requirements.txt
-python -m playwright install chromium
-
-python app.py
+.\.venv\Scripts\python.exe app.py
 ```
+
+如果不想安装 Git，也可以在 GitHub 页面点 **Code → Download ZIP**，解压后进入文件夹，双击 `run_web.bat`。
 
 第一次转录会自动下载 Whisper 模型：
 
@@ -154,7 +174,7 @@ Bilibili 转录会优先下载音频流，速度通常比下载完整视频更�
 检查依赖：
 
 ```powershell
-python -c "import gradio, playwright, faster_whisper, yt_dlp, mcp; print('ok')"
+.\.venv\Scripts\python.exe -c "import gradio, playwright, faster_whisper, yt_dlp, mcp; print('ok')"
 ffmpeg -version
 ```
 
@@ -225,13 +245,19 @@ Whisper：
 ### 常见问题
 
 **Q: 打开 `127.0.0.1:7860` 显示 refused to connect？**
-A: 本地服务没跑。先在项目目录执行 `python app.py`，并保持终端打开。
+A: 本地服务没跑。先双击 `run_web.bat`，或在项目目录执行 `.\.venv\Scripts\python.exe app.py`，并保持终端打开。
+
+**Q: 报 `python` 不是内部或外部命令？**
+A: 这台电脑没有正确安装 Python，或没有把 Python 加到 PATH。安装 64 位 Python 3.10 或更新版本；安装时勾选 “Add python.exe to PATH”。装好后重新打开终端，再执行 `python --version`。
+
+**Q: 报 `git` 不是内部或外部命令？**
+A: 没装 Git。可以安装 Git for Windows，或者不使用命令行：在 GitHub 页面点 **Code → Download ZIP**，解压后双击 `run_web.bat`。
 
 **Q: 运行时报 `Cannot find empty port in range: 7860-7860`？**
-A: 旧版本会固定占用 `7860`。更新后请先 `git pull`，再重新运行 `python app.py`；如果 `7860` 被占用，程序会自动换到下一个可用端口。也可以手动指定：
+A: 旧版本会固定占用 `7860`。更新后请先 `git pull`，再重新运行；如果 `7860` 被占用，程序会自动换到下一个可用端口。也可以手动指定：
 ```powershell
 $env:GRADIO_SERVER_PORT = "7861"
-python app.py
+.\.venv\Scripts\python.exe app.py
 ```
 
 **Q: 进度条停在转录中，是不是卡死了？**
@@ -241,7 +267,21 @@ A: 不一定。下载完成后进入 Whisper 转录，CPU 上处理长视频会�
 A: 执行：
 
 ```powershell
-python -m playwright install chromium
+.\.venv\Scripts\python.exe -m playwright install chromium
+```
+
+**Q: PowerShell 报 `running scripts is disabled on this system`？**
+A: 不要执行 `Activate.ps1`。最简单是双击 `run_web.bat`；如果要用 PowerShell 脚本，执行：
+```powershell
+powershell -ExecutionPolicy Bypass -File .\run_web.ps1
+```
+
+**Q: 报 `ModuleNotFoundError: No module named ...`？**
+A: 依赖没有装到当前 Python 环境。回到项目目录，执行：
+```powershell
+.\.venv\Scripts\python.exe -m pip install --upgrade -r requirements.txt
+.\.venv\Scripts\python.exe -m playwright install chromium
+.\.venv\Scripts\python.exe app.py
 ```
 
 **Q: Bilibili 下载视频失败，但转文字可以？**
@@ -289,14 +329,28 @@ Bare URLs without `https://`, such as `bilibili.com/video/BV...`, are accepted a
 
 ### Quick Start
 
-If you already have the repo locally:
+Prerequisites:
+
+- Python 3.10 or newer, preferably 64-bit.
+- Git.
+- Internet access for the first dependency, Playwright Chromium, and Whisper model downloads.
+- ffmpeg is usually optional for transcription, but recommended for downloading complete Bilibili MP4 files: `winget install Gyan.FFmpeg`.
+
+On Windows, the simplest path is to double-click `run_web.bat`. It creates `.venv` if needed, installs Python dependencies, installs Playwright Chromium, then starts the local web server.
+
+If you prefer manual PowerShell commands, use the project virtual environment directly. You do not need to run `Activate.ps1`.
 
 ```powershell
 Set-Location C:\path\to\douyin-transcribe
 git pull
-python -m pip install --upgrade -r requirements.txt
-python -m playwright install chromium
-python app.py
+
+if (!(Test-Path .\.venv\Scripts\python.exe)) { python -m venv .venv }
+
+.\.venv\Scripts\python.exe -m pip install --upgrade pip
+.\.venv\Scripts\python.exe -m pip install --upgrade -r requirements.txt
+.\.venv\Scripts\python.exe -m playwright install chromium
+
+.\.venv\Scripts\python.exe app.py
 ```
 
 Then open:
@@ -305,10 +359,22 @@ Then open:
 http://127.0.0.1:7860
 ```
 
-Keep the `python app.py` terminal open while using the web UI.
+Keep the `app.py` server terminal open while using the web UI.
 If port `7860` is already busy, the app will automatically try the next available port and print the actual local URL in the terminal.
 
-You can also double-click `run_web.bat` on Windows. The script creates `.venv` if needed, installs Python dependencies, installs Playwright Chromium, then starts `python app.py`.
+For a brand-new download:
+
+```powershell
+git clone https://github.com/ZY-ZhichaoYu/douyin-transcribe.git
+cd douyin-transcribe
+.\run_web.bat
+```
+
+If PowerShell blocks scripts with `running scripts is disabled on this system`, use `run_web.bat` or run:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\run_web.ps1
+```
 
 ### Dependencies
 
