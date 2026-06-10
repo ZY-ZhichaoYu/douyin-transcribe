@@ -5,8 +5,8 @@ Douyin / Bilibili → Text  (Gradio Web UI)
 适合不用 MCP 的普通用户在浏览器里直接使用。
 
 运行：
-    pip install -r requirements.txt
-    playwright install chromium
+    python -m pip install --upgrade -r requirements.txt
+    python -m playwright install chromium
     python app.py
 
 然后浏览器打开 http://127.0.0.1:7860
@@ -16,6 +16,9 @@ import os
 import socket
 import sys
 import tempfile
+import time
+from concurrent.futures import TimeoutError as FuturesTimeoutError
+from collections.abc import Generator
 
 import gradio as gr
 
@@ -32,6 +35,23 @@ from server import (
 )
 
 WEB_DEFAULT_MODEL = "base"
+
+
+def _format_error(exc: Exception) -> str:
+    message = str(exc).strip() or type(exc).__name__
+    lower = message.lower()
+    hints = []
+    if "executable doesn't exist" in lower and "playwright" in lower:
+        hints.append("先运行 python -m playwright install chromium")
+    if "geo-restricted" in lower or "may be deleted" in lower:
+        hints.append("这个视频可能已删除、地区限制、需要登录，或当前网络不可访问")
+    if "ffmpeg" in lower:
+        hints.append("Bilibili 下载完整视频需要 ffmpeg，可用 winget install Gyan.FFmpeg 安装")
+    if "no audio" in lower or "没有音频" in message:
+        hints.append("下载到的媒体没有音频流；可换一个链接，或更新后重试")
+    if hints:
+        message = f"{message}\n\n建议：" + "；".join(hints)
+    return message
 
 
 def _choose_server_port(default_port: int = 7860) -> int:
@@ -94,38 +114,95 @@ async def _download_for_ui(url: str, progress) -> tuple[str, str, float]:
     return out_path, platform, size_mb
 
 
-def transcribe(url: str, model_size: str, progress=gr.Progress()) -> tuple[str, str]:
+def transcribe(
+    url: str, model_size: str, progress=gr.Progress()
+) -> Generator[tuple[str, str], None, None]:
     """
     返回 (transcript_text, status_message)。
     用 gr.Progress 实时显示阶段。
     """
     if not url or not url.strip():
-        return "", "请输入抖音或 Bilibili 链接"
+        yield "", "请输入抖音或 Bilibili 链接"
+        return
 
     try:
-        text, platform, size_mb = asyncio.run(_transcribe_for_ui(url, model_size, progress))
+        progress(0.02, desc="提取链接...")
+        yield "", "进行中：正在提取链接..."
+        real_url = _extract_url(url)
+        platform = _detect_platform(real_url)
+        label = _platform_label(platform)
+
+        with tempfile.TemporaryDirectory(prefix="video_transcribe_") as tmp:
+            progress(0.20, desc=f"{label}: 下载转录媒体...")
+            yield "", f"进行中：{label} 正在下载适合转录的音频/视频流..."
+            media_path, platform = asyncio.run(_download_transcription_media(real_url, tmp))
+            size_mb = os.path.getsize(media_path) / 1024 / 1024
+
+            if model_size == "medium":
+                desc = "Whisper medium 转录中；长视频在 CPU 上可能需要很久..."
+            else:
+                desc = f"Whisper {model_size} 转录中..."
+            progress((0, None), desc=desc)
+            yield "", f"进行中：已下载 {size_mb:.1f}MB，{desc}"
+
+            future = _TRANSCRIBE_EXECUTOR.submit(_transcribe_sync, media_path, model_size)
+            started = time.monotonic()
+            last_reported = -1
+            while True:
+                try:
+                    text = future.result(timeout=1.0)
+                    break
+                except FuturesTimeoutError:
+                    elapsed = int(time.monotonic() - started)
+                    bucket = elapsed // 10
+                    progress((elapsed, None), desc=f"{desc} 已运行 {elapsed}s")
+                    if bucket != last_reported:
+                        last_reported = bucket
+                        yield "", f"进行中：{desc} 已运行 {elapsed}s。长视频在 CPU 上会停留较久。"
     except Exception as e:
-        return "", f"处理失败: {e}"
+        progress(None)
+        yield "", f"处理失败：{_format_error(e)}"
+        return
 
     if not text.strip():
-        return "", "转录完成，但视频中未检测到语音"
+        progress(1.0, desc="完成")
+        yield "", "转录完成，但视频中未检测到语音"
+        return
 
     progress(1.0, desc="完成")
-    status = f"✅ 完成 | {_platform_label(platform)} | 媒体 {size_mb:.1f}MB | 模型 {model_size}"
-    return text, status
+    status = f"完成 | {_platform_label(platform)} | 媒体 {size_mb:.1f}MB | 模型 {model_size}"
+    yield text, status
 
 
-def download_only(url: str, progress=gr.Progress()) -> tuple[str | None, str, str]:
+def download_only(
+    url: str, progress=gr.Progress()
+) -> Generator[tuple[object, str, str], None, None]:
     """只下载视频（最高画质），返回本地路径。"""
     if not url or not url.strip():
-        return None, "", "请输入抖音或 Bilibili 链接"
+        yield gr.update(value=None, visible=False), "", "请输入抖音或 Bilibili 链接"
+        return
     try:
-        out_path, platform, size_mb = asyncio.run(_download_for_ui(url, progress))
+        progress(0.02, desc="提取链接...")
+        yield gr.update(value=None, visible=False), "", "进行中：正在提取链接..."
+        real_url = _extract_url(url)
+        platform = _detect_platform(real_url)
+        label = _platform_label(platform)
+        if platform == "bilibili":
+            desc = "Bilibili: 下载最高画质并合并音视频，较大文件可能需要几分钟..."
+        else:
+            desc = f"{label}: 下载视频..."
+        progress((0, None), desc=desc)
+        yield gr.update(value=None, visible=False), "", f"进行中：{desc}"
+
+        out_dir = tempfile.mkdtemp(prefix="video_dl_")
+        out_path, platform = asyncio.run(_download_video_file(real_url, out_dir))
+        size_mb = os.path.getsize(out_path) / 1024 / 1024
         progress(1.0)
-        status = f"✅ 下载完成 | {_platform_label(platform)} | {size_mb:.1f}MB | 路径: {out_path}"
-        return out_path, out_path, status
+        status = f"下载完成 | {_platform_label(platform)} | {size_mb:.1f}MB | 路径: {out_path}"
+        yield gr.update(value=out_path, visible=True), out_path, status
     except Exception as e:
-        return None, "", f"失败: {e}"
+        progress(None)
+        yield gr.update(value=None, visible=False), "", f"失败：{_format_error(e)}"
 
 
 with gr.Blocks(title="视频转文字 / Douyin & Bilibili to Text") as demo:
@@ -158,7 +235,7 @@ with gr.Blocks(title="视频转文字 / Douyin & Bilibili to Text") as demo:
                     go_btn = gr.Button("开始转录", variant="primary")
                     dl_btn_main = gr.Button("下载视频")
                 dl_status_main = gr.Markdown()
-                dl_file_main = gr.File(label="下载文件")
+                dl_file_main = gr.File(label="下载文件", height=88, visible=False)
                 dl_path_main = gr.Textbox(label="本地文件路径", interactive=False)
             with gr.Column(scale=4):
                 status_out = gr.Markdown()
@@ -171,20 +248,27 @@ with gr.Blocks(title="视频转文字 / Douyin & Bilibili to Text") as demo:
             fn=transcribe,
             inputs=[url_in, model_in],
             outputs=[text_out, status_out],
+            show_progress_on=status_out,
         )
         dl_btn_main.click(
             fn=download_only,
             inputs=url_in,
             outputs=[dl_file_main, dl_path_main, dl_status_main],
+            show_progress_on=dl_status_main,
         )
 
     with gr.Tab("仅下载视频"):
         url2 = gr.Textbox(label="抖音 / Bilibili 链接", lines=2)
         dl_btn = gr.Button("下载（最高画质）", variant="primary")
         dl_status = gr.Markdown()
-        dl_file = gr.File(label="下载文件")
+        dl_file = gr.File(label="下载文件", height=88, visible=False)
         dl_path = gr.Textbox(label="本地文件路径", interactive=False)
-        dl_btn.click(fn=download_only, inputs=url2, outputs=[dl_file, dl_path, dl_status])
+        dl_btn.click(
+            fn=download_only,
+            inputs=url2,
+            outputs=[dl_file, dl_path, dl_status],
+            show_progress_on=dl_status,
+        )
 
     gr.Markdown(
         """

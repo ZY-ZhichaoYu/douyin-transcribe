@@ -27,6 +27,8 @@
 - Bilibili 视频：`https://www.bilibili.com/video/BV...`
 - Bilibili 短链：`https://b23.tv/...`（由 `yt-dlp` 解析）
 
+也可以粘贴不带 `https://` 的裸域名链接，例如 `bilibili.com/video/BV...`，程序会自动补全。
+
 ### 界面里能做什么？
 
 打开网页后主要有两个操作：
@@ -42,12 +44,13 @@
 Windows PowerShell：
 
 ```powershell
-Set-Location E:\ZY_Work_from_20260402\GitHub\douyin-transcribe
+Set-Location C:\path\to\douyin-transcribe
+# 例如本机：Set-Location E:\ZY_Work_from_20260402\GitHub\douyin-transcribe
 
 git pull
 python -m pip install --upgrade pip
-pip install -r requirements.txt
-playwright install chromium
+python -m pip install --upgrade -r requirements.txt
+python -m playwright install chromium
 
 python app.py
 ```
@@ -70,12 +73,13 @@ run_web.bat
 run_web.ps1
 ```
 
-最简单的方式是在资源管理器里双击 `run_web.bat`。它会进入项目目录，如果发现 `.venv` 虚拟环境就自动启用，然后运行 `python app.py`。
+最简单的方式是在资源管理器里双击 `run_web.bat`。它会进入项目目录，自动创建 `.venv`，补齐 Python 依赖，安装 Playwright Chromium，然后运行 `python app.py`。
+第一次运行需要联网下载依赖和浏览器内核，时间会比较久；后续再启动会快很多。
 
 PowerShell 方式：
 
 ```powershell
-Set-Location E:\ZY_Work_from_20260402\GitHub\douyin-transcribe
+Set-Location C:\path\to\douyin-transcribe
 .\run_web.ps1
 ```
 
@@ -97,8 +101,8 @@ python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 
 python -m pip install --upgrade pip
-pip install -r requirements.txt
-playwright install chromium
+python -m pip install --upgrade -r requirements.txt
+python -m playwright install chromium
 
 python app.py
 ```
@@ -150,7 +154,7 @@ Bilibili 转录会优先下载音频流，速度通常比下载完整视频更�
 检查依赖：
 
 ```powershell
-python -c "import gradio, playwright, faster_whisper, yt_dlp; print('ok')"
+python -c "import gradio, playwright, faster_whisper, yt_dlp, mcp; print('ok')"
 ffmpeg -version
 ```
 
@@ -237,7 +241,7 @@ A: 不一定。下载完成后进入 Whisper 转录，CPU 上处理长视频会�
 A: 执行：
 
 ```powershell
-playwright install chromium
+python -m playwright install chromium
 ```
 
 **Q: Bilibili 下载视频失败，但转文字可以？**
@@ -281,15 +285,17 @@ Supported inputs:
 - Bilibili BV URLs: `https://www.bilibili.com/video/BV...`
 - Bilibili short links: `https://b23.tv/...`
 
+Bare URLs without `https://`, such as `bilibili.com/video/BV...`, are accepted and normalized automatically.
+
 ### Quick Start
 
 If you already have the repo locally:
 
 ```powershell
-Set-Location E:\ZY_Work_from_20260402\GitHub\douyin-transcribe
+Set-Location C:\path\to\douyin-transcribe
 git pull
-pip install -r requirements.txt
-playwright install chromium
+python -m pip install --upgrade -r requirements.txt
+python -m playwright install chromium
 python app.py
 ```
 
@@ -302,7 +308,7 @@ http://127.0.0.1:7860
 Keep the `python app.py` terminal open while using the web UI.
 If port `7860` is already busy, the app will automatically try the next available port and print the actual local URL in the terminal.
 
-You can also double-click `run_web.bat` on Windows.
+You can also double-click `run_web.bat` on Windows. The script creates `.venv` if needed, installs Python dependencies, installs Playwright Chromium, then starts `python app.py`.
 
 ### Dependencies
 

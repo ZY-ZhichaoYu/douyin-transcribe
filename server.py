@@ -37,7 +37,10 @@ from mcp.server.fastmcp import FastMCP
 
 mcp = FastMCP("Video Analysis", log_level="ERROR")
 
-_URL_RE = re.compile(r'https?://\S+')
+_URL_RE = re.compile(
+    r'https?://\S+|(?:www\.)?(?:v\.douyin\.com|douyin\.com|iesdouyin\.com|bilibili\.com|b23\.tv)/\S+',
+    re.IGNORECASE,
+)
 _UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -82,6 +85,11 @@ def _extract_url(text: str) -> str:
         raise ValueError(f"输入中未找到有效URL: {text!r}")
     url = m.group(0)
     url = re.sub(r'[^\w./:?=&%-]+$', '', url)
+    if not re.match(r"https?://", url, re.IGNORECASE):
+        url = "https://" + url
+    parsed = urlparse(url)
+    if parsed.netloc.lower() == "bilibili.com":
+        url = parsed._replace(netloc="www.bilibili.com").geturl()
     return url
 
 
@@ -460,8 +468,18 @@ def _extract_bilibili_info(url: str) -> dict:
         "skip_download": True,
         "http_headers": {"User-Agent": _UA},
     }
-    with YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=False)
+    try:
+        with YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except Exception as e:
+        message = str(e)
+        lower = message.lower()
+        if "geo-restricted" in lower or "may be deleted" in lower:
+            raise RuntimeError(
+                "Bilibili 无法解析这个视频：它可能已删除、地区限制、需要登录，"
+                "或当前网络不可访问。请换一个公开可访问链接，或更新 yt-dlp 后重试。"
+            ) from e
+        raise RuntimeError(f"Bilibili 解析失败: {message}") from e
 
     entries = info.get("entries")
     if entries:
@@ -472,12 +490,95 @@ def _extract_bilibili_info(url: str) -> dict:
 
 
 def _bilibili_headers(info: dict, fmt: dict | None = None) -> dict[str, str]:
-    headers = {"User-Agent": _UA, "Referer": "https://www.bilibili.com/"}
+    headers = {
+        "User-Agent": _UA,
+        "Referer": "https://www.bilibili.com/",
+        "Accept": "*/*",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "Origin": "https://www.bilibili.com",
+    }
     for source in (info.get("http_headers") or {}, (fmt or {}).get("http_headers") or {}):
         for key, value in source.items():
             if value:
                 headers[key] = value
     return headers
+
+
+def _bilibili_bvid_from_url(url: str) -> str:
+    match = re.search(r"(BV[0-9A-Za-z]+)", url)
+    if not match:
+        raise RuntimeError("Bilibili 链接中未找到 BV 号")
+    return match.group(1)
+
+
+def _bilibili_api_json_sync(url: str, headers: dict[str, str]) -> dict:
+    text, _ = _read_url_text_sync(url, headers=headers)
+    data = json.loads(text)
+    if data.get("code") != 0:
+        raise RuntimeError(f"Bilibili API 返回错误: {data.get('code')} {data.get('message')}")
+    payload = data.get("data")
+    if not isinstance(payload, dict):
+        raise RuntimeError("Bilibili API 未返回 data 对象")
+    return payload
+
+
+def _bilibili_view_and_playurl_sync(url: str, qn: int = 16) -> tuple[dict, dict, str]:
+    bvid = _bilibili_bvid_from_url(url)
+    headers = _bilibili_headers({"http_headers": {"Referer": f"https://www.bilibili.com/video/{bvid}/"}})
+    view = _bilibili_api_json_sync(
+        f"https://api.bilibili.com/x/web-interface/view?bvid={bvid}",
+        headers,
+    )
+    cid = view.get("cid")
+    if not cid and view.get("pages"):
+        cid = view["pages"][0].get("cid")
+    if not cid:
+        raise RuntimeError("Bilibili API 未返回 cid")
+    playurl = _bilibili_api_json_sync(
+        f"https://api.bilibili.com/x/player/playurl?bvid={bvid}&cid={cid}&qn={qn}&fnval=16&fourk=1",
+        headers,
+    )
+    return view, playurl, bvid
+
+
+def _bilibili_media_urls(item: dict) -> list[str]:
+    urls = []
+    for key in ("baseUrl", "base_url"):
+        value = item.get(key)
+        if value:
+            urls.append(value)
+    for key in ("backupUrl", "backup_url"):
+        value = item.get(key) or []
+        if isinstance(value, str):
+            value = [value]
+        urls.extend(url for url in value if url)
+    return list(dict.fromkeys(urls))
+
+
+def _download_first_available(urls: list[str], out_path: str, headers: dict[str, str]) -> None:
+    last_error: Exception | None = None
+    for media_url in urls:
+        try:
+            if os.path.exists(out_path):
+                os.remove(out_path)
+            _download_sync(media_url, out_path, headers=headers)
+            return
+        except Exception as e:
+            last_error = e
+    raise RuntimeError(f"所有媒体直链下载失败: {last_error}") from last_error
+
+
+def _download_bilibili_transcription_media_via_api_sync(url: str, out_dir: str) -> str:
+    _, playurl, bvid = _bilibili_view_and_playurl_sync(url, qn=16)
+    audio = (playurl.get("dash") or {}).get("audio") or []
+    audio = [item for item in audio if _bilibili_media_urls(item)]
+    if not audio:
+        raise RuntimeError("Bilibili API 未返回可下载音频流")
+    best_audio = max(audio, key=lambda item: int(item.get("bandwidth") or 0))
+    headers = _bilibili_headers({"http_headers": {"Referer": f"https://www.bilibili.com/video/{bvid}/"}})
+    out_path = os.path.join(out_dir, "bilibili_media.m4a")
+    _download_first_available(_bilibili_media_urls(best_audio), out_path, headers)
+    return out_path
 
 
 def _is_direct_http_format(fmt: dict) -> bool:
@@ -520,12 +621,20 @@ def _safe_extension(ext: str | None, default: str = "mp4") -> str:
 
 
 def _download_bilibili_transcription_media_sync(url: str, out_dir: str) -> str:
-    info = _extract_bilibili_info(url)
-    fmt = _pick_bilibili_transcription_format(info)
-    ext = _safe_extension(fmt.get("ext"), "m4a")
-    out_path = os.path.join(out_dir, f"bilibili_media.{ext}")
-    _download_sync(fmt["url"], out_path, headers=_bilibili_headers(info, fmt))
-    return out_path
+    if re.search(r"BV[0-9A-Za-z]+", url):
+        try:
+            return _download_bilibili_transcription_media_via_api_sync(url, out_dir)
+        except Exception:
+            pass
+    try:
+        info = _extract_bilibili_info(url)
+        fmt = _pick_bilibili_transcription_format(info)
+        ext = _safe_extension(fmt.get("ext"), "m4a")
+        out_path = os.path.join(out_dir, f"bilibili_media.{ext}")
+        _download_sync(fmt["url"], out_path, headers=_bilibili_headers(info, fmt))
+        return out_path
+    except Exception:
+        return _download_bilibili_transcription_media_via_api_sync(url, out_dir)
 
 
 def _probe_media_streams(path: str) -> list[dict] | None:
@@ -562,6 +671,22 @@ def _has_video_stream(path: str) -> bool | None:
     return any(stream.get("codec_type") == "video" for stream in streams)
 
 
+def _has_audio_stream(path: str) -> bool | None:
+    streams = _probe_media_streams(path)
+    if streams is None:
+        return None
+    return any(stream.get("codec_type") == "audio" for stream in streams)
+
+
+def _ensure_audio_stream(path: str) -> None:
+    has_audio = _has_audio_stream(path)
+    if has_audio is False:
+        raise RuntimeError(
+            "下载完成，但转录媒体没有音频流。这个视频可能本身无声，"
+            "也可能是平台返回了纯视频/DASH 分片；请更新后重试或换一个链接。"
+        )
+
+
 def _ensure_video_stream(path: str) -> None:
     has_video = _has_video_stream(path)
     if has_video is False:
@@ -591,7 +716,68 @@ def _find_downloaded_file(out_dir: str, before: set[str]) -> str:
     raise RuntimeError("下载完成但未找到输出文件")
 
 
+def _download_bilibili_video_via_api_sync(url: str, out_dir: str) -> str:
+    _, playurl, bvid = _bilibili_view_and_playurl_sync(url, qn=64)
+    dash = playurl.get("dash") or {}
+    videos = [item for item in dash.get("video") or [] if _bilibili_media_urls(item)]
+    audios = [item for item in dash.get("audio") or [] if _bilibili_media_urls(item)]
+    if not videos or not audios:
+        raise RuntimeError("Bilibili API 未返回可合并的 DASH 音视频流")
+
+    avc_videos = [
+        item for item in videos
+        if str(item.get("codecs") or "").lower().startswith("avc1")
+    ]
+    video_pool = avc_videos or videos
+    best_video = max(
+        video_pool,
+        key=lambda item: (
+            int(item.get("height") or 0),
+            int(item.get("bandwidth") or 0),
+        ),
+    )
+    best_audio = max(audios, key=lambda item: int(item.get("bandwidth") or 0))
+
+    headers = _bilibili_headers({"http_headers": {"Referer": f"https://www.bilibili.com/video/{bvid}/"}})
+    video_path = os.path.join(out_dir, "bilibili_video.m4s")
+    audio_path = os.path.join(out_dir, "bilibili_audio.m4s")
+    out_path = os.path.join(out_dir, "bilibili_video.mp4")
+
+    _download_first_available(_bilibili_media_urls(best_video), video_path, headers)
+    _download_first_available(_bilibili_media_urls(best_audio), audio_path, headers)
+
+    if not shutil.which("ffmpeg"):
+        raise RuntimeError(
+            "Bilibili API fallback 已下载音视频分片，但合并 MP4 需要 ffmpeg。"
+            "请安装 ffmpeg 后重试，例如 winget install Gyan.FFmpeg。"
+        )
+    proc = subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-i",
+            video_path,
+            "-i",
+            audio_path,
+            "-c",
+            "copy",
+            out_path,
+        ],
+        text=True,
+        capture_output=True,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"ffmpeg 合并 Bilibili 音视频失败: {proc.stderr.strip()[-500:]}")
+    _ensure_video_stream(out_path)
+    return out_path
+
+
 def _download_bilibili_video_sync(url: str, out_dir: str) -> str:
+    if re.search(r"BV[0-9A-Za-z]+", url):
+        try:
+            return _download_bilibili_video_via_api_sync(url, out_dir)
+        except Exception:
+            pass
     YoutubeDL = _load_ytdlp()
     before = {
         os.path.join(out_dir, name)
@@ -609,19 +795,22 @@ def _download_bilibili_video_sync(url: str, out_dir: str) -> str:
         "windowsfilenames": True,
         "http_headers": {"User-Agent": _UA},
     }
-    with YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=True)
+    try:
+        with YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=True)
 
-    downloads = info.get("requested_downloads") or []
-    for item in downloads:
-        for key in ("filepath", "filename", "_filename"):
-            path = item.get(key)
-            if path and os.path.exists(path):
-                _ensure_video_stream(path)
-                return path
-    path = _find_downloaded_file(out_dir, before)
-    _ensure_video_stream(path)
-    return path
+        downloads = info.get("requested_downloads") or []
+        for item in downloads:
+            for key in ("filepath", "filename", "_filename"):
+                path = item.get(key)
+                if path and os.path.exists(path):
+                    _ensure_video_stream(path)
+                    return path
+        path = _find_downloaded_file(out_dir, before)
+        _ensure_video_stream(path)
+        return path
+    except Exception:
+        return _download_bilibili_video_via_api_sync(url, out_dir)
 
 
 # ── 下载（urllib，无 ffmpeg 网络调用）───────────────────
@@ -642,6 +831,8 @@ def _download_sync(video_url: str, out_path: str, headers: dict | None = None) -
                 if not chunk:
                     break
                 f.write(chunk)
+    if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
+        raise RuntimeError("下载失败：平台返回了空文件，请稍后重试或换一个链接。")
 
 
 # ── 转录（faster-whisper，beam_size=1 加速）──────────────
@@ -672,11 +863,13 @@ async def _download_transcription_media(real_url: str, out_dir: str) -> tuple[st
         dl_url = _pick_url_for_transcription(video)
         out_path = os.path.join(out_dir, "douyin_media.mp4")
         await loop.run_in_executor(_DOWNLOAD_EXECUTOR, _download_sync, dl_url, out_path)
+        await loop.run_in_executor(_DOWNLOAD_EXECUTOR, _ensure_audio_stream, out_path)
         return out_path, platform
     if platform == "bilibili":
         out_path = await loop.run_in_executor(
             _DOWNLOAD_EXECUTOR, _download_bilibili_transcription_media_sync, real_url, out_dir
         )
+        await loop.run_in_executor(_DOWNLOAD_EXECUTOR, _ensure_audio_stream, out_path)
         return out_path, platform
     raise ValueError(f"暂不支持这个平台: {platform}")
 
