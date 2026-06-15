@@ -17,6 +17,7 @@ import queue
 import socket
 import sys
 import tempfile
+import threading
 import time
 from collections.abc import Generator
 
@@ -83,6 +84,49 @@ def _stage_line(step: int, total: int, text: str) -> str:
     return f"**{'①②③④'[step - 1]}/{total} {text}**"
 
 
+def _fmt_mb(num_bytes: float) -> str:
+    return f"{num_bytes / 1024 / 1024:.1f}MB"
+
+
+def _stream_download(coro_factory):
+    """
+    在后台线程里跑一个下载协程，实时把字节进度回传出来。
+
+    coro_factory(on_progress) 必须返回一个 awaitable，最终结果是
+    (path, platform)。本函数是生成器，依次产出：
+      ("progress", downloaded_bytes, total_bytes_or_None)
+      ("done", path, platform)        —— 成功
+      ("error", exception)            —— 失败
+    放在独立线程里是因为下载协程本身要新建事件循环（Playwright），
+    没法和读取队列的生成器线程共用一个 asyncio.run。
+    """
+    q: queue.Queue = queue.Queue()
+
+    def on_progress(done: int, total: int | None) -> None:
+        q.put(("progress", done, total))
+
+    def worker() -> None:
+        try:
+            result = asyncio.run(coro_factory(on_progress))
+            q.put(("result", result))
+        except Exception as exc:  # noqa: BLE001 - 转发给生成器线程统一处理
+            q.put(("error", exc))
+
+    threading.Thread(target=worker, daemon=True).start()
+
+    while True:
+        item = q.get()
+        if item[0] == "progress":
+            yield item
+        elif item[0] == "result":
+            path, platform = item[1]
+            yield ("done", path, platform)
+            return
+        else:
+            yield ("error", item[1])
+            return
+
+
 def transcribe(
     url: str, model_size: str, progress=gr.Progress()
 ) -> Generator[tuple[str, str], None, None]:
@@ -105,12 +149,30 @@ def transcribe(
         label = _platform_label(platform)
 
         with tempfile.TemporaryDirectory(prefix="video_transcribe_") as tmp:
-            progress(0.08, desc=f"{label}: 下载媒体…")
+            # 阶段②：下载。进度条占 0–25%，下载的字节进度映射进去。
+            progress(0.0, desc=f"{label}: 下载媒体…")
             yield "", _stage_line(2, 3, f"从 {label} 下载音频/视频流…")
-            media_path, platform = asyncio.run(_download_transcription_media(real_url, tmp))
+            media_path = None
+            for ev in _stream_download(
+                lambda cb: _download_transcription_media(real_url, tmp, on_progress=cb)
+            ):
+                if ev[0] == "progress":
+                    done, total = ev[1], ev[2]
+                    if total:
+                        frac = min(done / total, 1.0)
+                        progress(0.25 * frac, desc=f"下载 {frac * 100:.0f}%")
+                        detail = f"下载中 {_fmt_mb(done)} / {_fmt_mb(total)}（{frac * 100:.0f}%）"
+                    else:
+                        progress((done, None), desc="下载中")
+                        detail = f"下载中 {_fmt_mb(done)}"
+                    yield "", _stage_line(2, 3, f"从 {label} {detail}")
+                elif ev[0] == "done":
+                    media_path, platform = ev[1], ev[2]
+                else:
+                    raise ev[1]
             size_mb = os.path.getsize(media_path) / 1024 / 1024
 
-            # 把转录丢到单线程执行器里跑，靠队列把每段的进度/文字回传到这里。
+            # 阶段③：把转录丢到单线程执行器里跑，靠队列把每段的进度/文字回传到这里。
             q: queue.Queue = queue.Queue()
 
             def on_segment(end: float, total: float, text_so_far: str) -> None:
@@ -138,7 +200,7 @@ def transcribe(
                     elapsed = time.monotonic() - started
                     if total and total > 0:
                         frac = min(end / total, 0.999)
-                        progress(frac, desc=f"转录 {frac * 100:.0f}%")
+                        progress(0.25 + 0.75 * frac, desc=f"转录 {frac * 100:.0f}%")
                         eta = ""
                         if frac > 0.03:
                             remain = elapsed * (1 - frac) / frac
@@ -187,28 +249,51 @@ def download_only(
     if not url or not url.strip():
         yield gr.update(value=None, visible=False), "", "请输入抖音或 Bilibili 链接"
         return
+    hidden = gr.update(value=None, visible=False)
     try:
         progress(0.02, desc="提取链接...")
-        yield gr.update(value=None, visible=False), "", "进行中：正在提取链接..."
+        yield hidden, "", "进行中：正在提取链接..."
         real_url = _extract_url(url)
         platform = _detect_platform(real_url)
         label = _platform_label(platform)
+        # Bilibili 走 DASH 分片合并，拿不到线性字节进度，只显示阶段提示。
         if platform == "bilibili":
-            desc = "Bilibili: 下载最高画质并合并音视频，较大文件可能需要几分钟..."
+            hint = "Bilibili：下载最高画质并合并音视频，较大文件可能需要几分钟…"
         else:
-            desc = f"{label}: 下载视频..."
-        progress((0, None), desc=desc)
-        yield gr.update(value=None, visible=False), "", f"进行中：{desc}"
+            hint = f"{label}：下载视频…"
+        progress((0, None), desc="下载中")
+        yield hidden, "", f"**{hint}**"
 
         out_dir = tempfile.mkdtemp(prefix="video_dl_")
-        out_path, platform = asyncio.run(_download_video_file(real_url, out_dir))
+        out_path = None
+        for ev in _stream_download(
+            lambda cb: _download_video_file(real_url, out_dir, on_progress=cb)
+        ):
+            if ev[0] == "progress":
+                done, total = ev[1], ev[2]
+                if total:
+                    frac = min(done / total, 1.0)
+                    progress(frac, desc=f"下载 {frac * 100:.0f}%")
+                    detail = f"下载中 {_fmt_mb(done)} / {_fmt_mb(total)}（{frac * 100:.0f}%）"
+                else:
+                    progress((done, None), desc="下载中")
+                    detail = f"下载中 {_fmt_mb(done)}"
+                yield hidden, "", f"**{label} {detail}**"
+            elif ev[0] == "done":
+                out_path, platform = ev[1], ev[2]
+            else:
+                raise ev[1]
+
         size_mb = os.path.getsize(out_path) / 1024 / 1024
-        progress(1.0)
-        status = f"下载完成 | {_platform_label(platform)} | {size_mb:.1f}MB | 路径: {out_path}"
+        progress(1.0, desc="完成")
+        status = (
+            f"✅ **下载完成** · {_platform_label(platform)} · {size_mb:.1f}MB\n\n"
+            f"本地路径：`{out_path}`"
+        )
         yield gr.update(value=out_path, visible=True), out_path, status
     except Exception as e:
         progress(None)
-        yield gr.update(value=None, visible=False), "", f"失败：{_format_error(e)}"
+        yield hidden, "", f"❌ 失败：{_format_error(e)}"
 
 
 THEME = gr.themes.Soft(

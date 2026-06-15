@@ -18,6 +18,7 @@ Architecture:
 """
 
 import asyncio
+import functools
 import json
 import os
 import re
@@ -555,20 +556,24 @@ def _bilibili_media_urls(item: dict) -> list[str]:
     return list(dict.fromkeys(urls))
 
 
-def _download_first_available(urls: list[str], out_path: str, headers: dict[str, str]) -> None:
+def _download_first_available(
+    urls: list[str], out_path: str, headers: dict[str, str], progress_cb=None
+) -> None:
     last_error: Exception | None = None
     for media_url in urls:
         try:
             if os.path.exists(out_path):
                 os.remove(out_path)
-            _download_sync(media_url, out_path, headers=headers)
+            _download_sync(media_url, out_path, headers=headers, progress_cb=progress_cb)
             return
         except Exception as e:
             last_error = e
     raise RuntimeError(f"所有媒体直链下载失败: {last_error}") from last_error
 
 
-def _download_bilibili_transcription_media_via_api_sync(url: str, out_dir: str) -> str:
+def _download_bilibili_transcription_media_via_api_sync(
+    url: str, out_dir: str, progress_cb=None
+) -> str:
     _, playurl, bvid = _bilibili_view_and_playurl_sync(url, qn=16)
     audio = (playurl.get("dash") or {}).get("audio") or []
     audio = [item for item in audio if _bilibili_media_urls(item)]
@@ -577,7 +582,7 @@ def _download_bilibili_transcription_media_via_api_sync(url: str, out_dir: str) 
     best_audio = max(audio, key=lambda item: int(item.get("bandwidth") or 0))
     headers = _bilibili_headers({"http_headers": {"Referer": f"https://www.bilibili.com/video/{bvid}/"}})
     out_path = os.path.join(out_dir, "bilibili_media.m4a")
-    _download_first_available(_bilibili_media_urls(best_audio), out_path, headers)
+    _download_first_available(_bilibili_media_urls(best_audio), out_path, headers, progress_cb)
     return out_path
 
 
@@ -620,10 +625,10 @@ def _safe_extension(ext: str | None, default: str = "mp4") -> str:
     return ext
 
 
-def _download_bilibili_transcription_media_sync(url: str, out_dir: str) -> str:
+def _download_bilibili_transcription_media_sync(url: str, out_dir: str, progress_cb=None) -> str:
     if re.search(r"BV[0-9A-Za-z]+", url):
         try:
-            return _download_bilibili_transcription_media_via_api_sync(url, out_dir)
+            return _download_bilibili_transcription_media_via_api_sync(url, out_dir, progress_cb)
         except Exception:
             pass
     try:
@@ -631,10 +636,10 @@ def _download_bilibili_transcription_media_sync(url: str, out_dir: str) -> str:
         fmt = _pick_bilibili_transcription_format(info)
         ext = _safe_extension(fmt.get("ext"), "m4a")
         out_path = os.path.join(out_dir, f"bilibili_media.{ext}")
-        _download_sync(fmt["url"], out_path, headers=_bilibili_headers(info, fmt))
+        _download_sync(fmt["url"], out_path, headers=_bilibili_headers(info, fmt), progress_cb=progress_cb)
         return out_path
     except Exception:
-        return _download_bilibili_transcription_media_via_api_sync(url, out_dir)
+        return _download_bilibili_transcription_media_via_api_sync(url, out_dir, progress_cb)
 
 
 def _probe_media_streams(path: str) -> list[dict] | None:
@@ -815,8 +820,19 @@ def _download_bilibili_video_sync(url: str, out_dir: str) -> str:
 
 # ── 下载（urllib，无 ffmpeg 网络调用）───────────────────
 
-def _download_sync(video_url: str, out_path: str, headers: dict | None = None) -> None:
-    """用 urllib 同步下载媒体文件。在线程池中调用。"""
+def _download_sync(
+    video_url: str,
+    out_path: str,
+    headers: dict | None = None,
+    progress_cb=None,
+) -> None:
+    """
+    用 urllib 同步下载媒体文件。在线程池中调用。
+
+    progress_cb: 可选回调，签名 progress_cb(downloaded_bytes, total_bytes_or_None)。
+        total 来自 Content-Length，分块传输时可能为 None。回调被限流到约每
+        0.2 秒一次，避免刷爆调用方的队列。
+    """
     request_headers = {"User-Agent": _UA, "Referer": "https://www.douyin.com/"}
     if headers:
         request_headers.update(headers)
@@ -825,12 +841,23 @@ def _download_sync(video_url: str, out_path: str, headers: dict | None = None) -
         headers=request_headers,
     )
     with urllib.request.urlopen(req, context=_SSL_CTX, timeout=90) as r:
+        total = int(r.headers.get("Content-Length") or 0) or None
+        downloaded = 0
+        last_emit = 0.0
         with open(out_path, "wb") as f:
             while True:
                 chunk = r.read(65536)
                 if not chunk:
                     break
                 f.write(chunk)
+                downloaded += len(chunk)
+                if progress_cb is not None:
+                    now = time.monotonic()
+                    if now - last_emit >= 0.2 or (total and downloaded >= total):
+                        last_emit = now
+                        progress_cb(downloaded, total)
+    if progress_cb is not None:
+        progress_cb(downloaded, total)
     if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
         raise RuntimeError("下载失败：平台返回了空文件，请稍后重试或换一个链接。")
 
@@ -879,35 +906,58 @@ def _transcribe_sync(file_path: str, model_size: str = WHISPER_MODEL) -> str:
 
 # ── 通用平台流程 ─────────────────────────────────────────
 
-async def _download_transcription_media(real_url: str, out_dir: str) -> tuple[str, str]:
-    """Download the best media file for transcription and return (path, platform)."""
+async def _download_transcription_media(
+    real_url: str, out_dir: str, on_progress=None
+) -> tuple[str, str]:
+    """
+    Download the best media file for transcription and return (path, platform).
+
+    on_progress: 可选回调 on_progress(downloaded_bytes, total_bytes_or_None)，
+        在下载过程中实时回报字节进度（抖音、Bilibili 直链/音频流都支持）。
+    """
     platform = _detect_platform(real_url)
     loop = asyncio.get_running_loop()
     if platform == "douyin":
         video = await _get_douyin_video_object(real_url)
         dl_url = _pick_url_for_transcription(video)
         out_path = os.path.join(out_dir, "douyin_media.mp4")
-        await loop.run_in_executor(_DOWNLOAD_EXECUTOR, _download_sync, dl_url, out_path)
+        await loop.run_in_executor(
+            _DOWNLOAD_EXECUTOR,
+            functools.partial(_download_sync, dl_url, out_path, progress_cb=on_progress),
+        )
         await loop.run_in_executor(_DOWNLOAD_EXECUTOR, _ensure_audio_stream, out_path)
         return out_path, platform
     if platform == "bilibili":
         out_path = await loop.run_in_executor(
-            _DOWNLOAD_EXECUTOR, _download_bilibili_transcription_media_sync, real_url, out_dir
+            _DOWNLOAD_EXECUTOR,
+            functools.partial(
+                _download_bilibili_transcription_media_sync, real_url, out_dir, on_progress
+            ),
         )
         await loop.run_in_executor(_DOWNLOAD_EXECUTOR, _ensure_audio_stream, out_path)
         return out_path, platform
     raise ValueError(f"暂不支持这个平台: {platform}")
 
 
-async def _download_video_file(real_url: str, out_dir: str) -> tuple[str, str]:
-    """Download the source video and return (path, platform)."""
+async def _download_video_file(
+    real_url: str, out_dir: str, on_progress=None
+) -> tuple[str, str]:
+    """
+    Download the source video and return (path, platform).
+
+    on_progress: 抖音单文件下载支持实时字节进度；Bilibili 走 DASH 分片合并，
+        进度无法简单线性回报，这里忽略该回调。
+    """
     platform = _detect_platform(real_url)
     loop = asyncio.get_running_loop()
     if platform == "douyin":
         video = await _get_douyin_video_object(real_url)
         dl_url = _pick_url_for_download(video)
         out_path = os.path.join(out_dir, "douyin_video.mp4")
-        await loop.run_in_executor(_DOWNLOAD_EXECUTOR, _download_sync, dl_url, out_path)
+        await loop.run_in_executor(
+            _DOWNLOAD_EXECUTOR,
+            functools.partial(_download_sync, dl_url, out_path, progress_cb=on_progress),
+        )
         await loop.run_in_executor(_DOWNLOAD_EXECUTOR, _ensure_video_stream, out_path)
         return out_path, platform
     if platform == "bilibili":
