@@ -310,6 +310,19 @@ THEME = gr.themes.Soft(
         "PingFang SC",
         "sans-serif",
     ],
+).set(
+    # Soft 主题默认把组件标签做成主色（玫红）：暗色下是玫红底，亮色下是玫红字，
+    # 喧宾夺主。把标签的底色和文字都改成低调的中性色，主色只留给按钮和选中态。
+    block_label_background_fill="*neutral_100",
+    block_label_background_fill_dark="*neutral_800",
+    block_label_text_color="*neutral_600",
+    block_label_text_color_dark="*neutral_200",
+    block_label_border_width="0px",
+    block_label_border_width_dark="0px",
+    # 关键：字段标题文字色（视频链接 / Whisper 模型 等）默认是 *primary_500。
+    block_title_text_color="*neutral_600",
+    block_title_text_color_dark="*neutral_200",
+    block_title_text_weight="600",
 )
 
 CSS = """
