@@ -205,44 +205,144 @@ def download_only(
         yield gr.update(value=None, visible=False), "", f"失败：{_format_error(e)}"
 
 
-with gr.Blocks(title="视频转文字 / Douyin & Bilibili to Text") as demo:
-    gr.Markdown(
-        """
-        # 抖音 / Bilibili 视频 → 文字稿
-        粘贴抖音分享链接、整段抖音分享文本，或 Bilibili `BV` 链接，一键提取视频中的语音文字。
+THEME = gr.themes.Soft(
+    primary_hue=gr.themes.colors.rose,
+    secondary_hue=gr.themes.colors.sky,
+    neutral_hue=gr.themes.colors.slate,
+    radius_size=gr.themes.sizes.radius_lg,
+    # 仅用系统字体，不联网拉取 Google Fonts，符合"全程本地"的定位。
+    font=[
+        "Inter",
+        "system-ui",
+        "Segoe UI",
+        "Microsoft YaHei",
+        "PingFang SC",
+        "sans-serif",
+    ],
+)
 
-        - 默认 **base** 模型：速度和识别质量比较均衡，适合拿去给 AI 做后续分析
-        - 很急可切到 **tiny**；复杂内容/嘉宾对谈建议切到 **small** 或 **medium**
-        - 可直接转录，也可以只下载原视频到本机
+CSS = """
+.gradio-container {
+    max-width: 1080px !important;
+    margin: 0 auto !important;
+}
+
+/* ---- Hero header ---- */
+#hero {
+    background: linear-gradient(135deg, #fb7185 0%, #f43f5e 45%, #6366f1 100%);
+    border-radius: 20px;
+    padding: 28px 32px;
+    margin-bottom: 8px;
+    color: #fff;
+    box-shadow: 0 10px 30px -12px rgba(244, 63, 94, 0.55);
+}
+#hero h1 {
+    margin: 0 0 6px 0;
+    font-size: 1.8rem;
+    font-weight: 800;
+    letter-spacing: -0.01em;
+    color: #fff;
+}
+#hero p { margin: 0; opacity: 0.95; font-size: 0.97rem; line-height: 1.55; }
+#hero .badges { margin-top: 14px; display: flex; flex-wrap: wrap; gap: 8px; }
+#hero .badges span {
+    background: rgba(255, 255, 255, 0.18);
+    border: 1px solid rgba(255, 255, 255, 0.28);
+    padding: 4px 12px;
+    border-radius: 999px;
+    font-size: 0.8rem;
+    backdrop-filter: blur(4px);
+}
+
+/* ---- Card panels ---- */
+.soft-card {
+    border: 1px solid var(--block-border-color);
+    border-radius: 16px !important;
+    padding: 18px !important;
+    background: var(--block-background-fill);
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
+}
+
+/* ---- Primary action button ---- */
+#go-btn { font-weight: 700; }
+#go-btn, #dl-btn { min-height: 46px; }
+
+/* ---- Transcript box ---- */
+#transcript textarea {
+    font-size: 0.95rem;
+    line-height: 1.6;
+}
+
+/* ---- Footer ---- */
+#footer {
+    margin-top: 18px;
+    padding: 16px 20px;
+    border-radius: 14px;
+    background: var(--block-background-fill);
+    border: 1px solid var(--block-border-color);
+    font-size: 0.86rem;
+    color: var(--body-text-color-subdued);
+}
+#footer strong { color: var(--body-text-color); }
+"""
+
+with gr.Blocks(title="视频转文字 / Douyin & Bilibili to Text") as demo:
+    gr.HTML(
+        """
+        <div id="hero">
+            <h1>🎬 抖音 / Bilibili 视频 → 文字稿</h1>
+            <p>粘贴抖音分享链接、整段抖音分享文本，或 Bilibili <code>BV</code> 链接，一键提取视频里说的话。
+            所有处理都在本地完成。</p>
+            <div class="badges">
+                <span>🔒 本地运行</span>
+                <span>⚡ faster-whisper</span>
+                <span>🎯 中英自动识别</span>
+                <span>📋 一键复制</span>
+            </div>
+        </div>
         """
     )
 
-    with gr.Tab("转文字"):
-        with gr.Row():
+    with gr.Tab("📝 转文字"):
+        with gr.Row(equal_height=False):
             with gr.Column(scale=3):
-                url_in = gr.Textbox(
-                    label="视频链接 / 分享文本",
-                    placeholder="粘贴 https://v.douyin.com/xxx/、整段抖音分享文本，或 https://www.bilibili.com/video/BV...",
-                    lines=2,
-                )
-                model_in = gr.Radio(
-                    choices=["tiny", "base", "small", "medium"],
-                    value=WEB_DEFAULT_MODEL,
-                    label="Whisper 模型",
-                    info="tiny: 最快但易错 / base: 默认均衡 / small: 更准更慢 / medium: 最准但长视频会非常慢",
-                )
-                with gr.Row():
-                    go_btn = gr.Button("开始转录", variant="primary")
-                    dl_btn_main = gr.Button("下载视频")
-                dl_status_main = gr.Markdown()
-                dl_file_main = gr.File(label="下载文件", height=88, visible=False)
-                dl_path_main = gr.Textbox(label="本地文件路径", interactive=False)
+                with gr.Group(elem_classes="soft-card"):
+                    url_in = gr.Textbox(
+                        label="视频链接 / 分享文本",
+                        placeholder="粘贴 https://v.douyin.com/xxx/、整段抖音分享文本，或 https://www.bilibili.com/video/BV...",
+                        lines=3,
+                    )
+                    model_in = gr.Radio(
+                        choices=["tiny", "base", "small", "medium"],
+                        value=WEB_DEFAULT_MODEL,
+                        label="Whisper 模型",
+                        info="tiny 最快易错 · base 默认均衡 · small 更准更慢 · medium 最准但长视频很慢",
+                    )
+                    with gr.Row():
+                        go_btn = gr.Button(
+                            "开始转录", variant="primary", scale=2, elem_id="go-btn"
+                        )
+                        dl_btn_main = gr.Button("下载视频", scale=1)
+
+                with gr.Group(elem_classes="soft-card"):
+                    dl_status_main = gr.Markdown("下载结果会显示在这里。")
+                    dl_file_main = gr.File(label="下载文件", height=88, visible=False)
+                    dl_path_main = gr.Textbox(
+                        label="本地文件路径",
+                        interactive=False,
+                        buttons=["copy"],
+                    )
+
             with gr.Column(scale=4):
-                status_out = gr.Markdown()
-                text_out = gr.Textbox(
-                    label="文字稿（可复制）",
-                    lines=20,
-                )
+                with gr.Group(elem_classes="soft-card"):
+                    status_out = gr.Markdown("准备就绪，粘贴链接后点击 **开始转录**。")
+                    text_out = gr.Textbox(
+                        label="文字稿",
+                        lines=22,
+                        buttons=["copy"],
+                        elem_id="transcript",
+                        placeholder="转录完成后，文字稿会出现在这里，可一键复制给 AI 做摘要 / 翻译 / 分析。",
+                    )
 
         go_btn.click(
             fn=transcribe,
@@ -257,12 +357,23 @@ with gr.Blocks(title="视频转文字 / Douyin & Bilibili to Text") as demo:
             show_progress_on=dl_status_main,
         )
 
-    with gr.Tab("仅下载视频"):
-        url2 = gr.Textbox(label="抖音 / Bilibili 链接", lines=2)
-        dl_btn = gr.Button("下载（最高画质）", variant="primary")
-        dl_status = gr.Markdown()
-        dl_file = gr.File(label="下载文件", height=88, visible=False)
-        dl_path = gr.Textbox(label="本地文件路径", interactive=False)
+    with gr.Tab("⬇️ 仅下载视频"):
+        with gr.Group(elem_classes="soft-card"):
+            url2 = gr.Textbox(
+                label="抖音 / Bilibili 链接",
+                placeholder="粘贴抖音分享链接 / 文本，或 Bilibili BV 链接",
+                lines=3,
+            )
+            dl_btn = gr.Button(
+                "下载（最高画质）", variant="primary", elem_id="dl-btn"
+            )
+            dl_status = gr.Markdown("下载结果会显示在这里。")
+            dl_file = gr.File(label="下载文件", height=88, visible=False)
+            dl_path = gr.Textbox(
+                label="本地文件路径",
+                interactive=False,
+                buttons=["copy"],
+            )
         dl_btn.click(
             fn=download_only,
             inputs=url2,
@@ -270,12 +381,12 @@ with gr.Blocks(title="视频转文字 / Douyin & Bilibili to Text") as demo:
             show_progress_on=dl_status,
         )
 
-    gr.Markdown(
+    gr.HTML(
         """
-        ---
-        **隐私说明**：所有处理在本地完成，视频和音频不上传任何第三方服务（Whisper 模型本地运行）。
-
-        **致谢**：技术栈 — Playwright（抖音元数据）+ yt-dlp（Bilibili 下载）+ faster-whisper（语音识别）+ Gradio（界面）。
+        <div id="footer">
+            <strong>🔒 隐私说明</strong> · 所有处理在本地完成，视频和音频不上传任何第三方服务，Whisper 模型本地运行。<br>
+            <strong>🛠 技术栈</strong> · Playwright（抖音元数据）· yt-dlp（Bilibili 下载）· faster-whisper（语音识别）· Gradio（界面）。
+        </div>
         """
     )
 
@@ -284,4 +395,10 @@ if __name__ == "__main__":
     port = _choose_server_port()
     if port != 7860 and not os.environ.get("GRADIO_SERVER_PORT"):
         print(f"127.0.0.1:7860 已被占用，改用 http://127.0.0.1:{port}")
-    demo.launch(server_name="127.0.0.1", server_port=port, inbrowser=False)
+    demo.launch(
+        server_name="127.0.0.1",
+        server_port=port,
+        inbrowser=False,
+        theme=THEME,
+        css=CSS,
+    )
