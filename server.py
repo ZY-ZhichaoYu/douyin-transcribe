@@ -837,19 +837,44 @@ def _download_sync(video_url: str, out_path: str, headers: dict | None = None) -
 
 # ── 转录（faster-whisper，beam_size=1 加速）──────────────
 
-def _transcribe_sync(file_path: str, model_size: str = WHISPER_MODEL) -> str:
+def _transcribe_segments_sync(
+    file_path: str,
+    model_size: str = WHISPER_MODEL,
+    on_segment=None,
+) -> str:
     """
-    用 faster-whisper 转录视频/音频文件。
+    用 faster-whisper 转录视频/音频文件，返回完整文字稿。
+
     beam_size=1（贪心解码）比 beam_size=5 快。语言交给 Whisper 自动识别，
     避免英文口播被强制按中文解码。
+
+    on_segment: 可选回调，每解码完一段就调用一次，签名为
+        on_segment(segment_end_seconds, total_audio_seconds, text_so_far)。
+        用于在 Web UI 里显示真实进度百分比和流式文字。faster-whisper 的
+        segments 是惰性生成器，遍历它本身就是在做转录，所以回调能给出
+        随转录推进的增量进度。
     """
     from faster_whisper import WhisperModel
 
     if model_size not in _ALLOWED_MODELS:
         model_size = WHISPER_MODEL
     model = WhisperModel(model_size, device="cpu", compute_type="int8")
-    segments, _ = model.transcribe(file_path, beam_size=1)
-    return "\n".join(seg.text.strip() for seg in segments)
+    segments, info = model.transcribe(file_path, beam_size=1)
+    total = float(getattr(info, "duration", 0.0) or 0.0)
+
+    parts: list[str] = []
+    for seg in segments:
+        text = seg.text.strip()
+        if text:
+            parts.append(text)
+        if on_segment is not None:
+            on_segment(float(seg.end or 0.0), total, "\n".join(parts))
+    return "\n".join(parts)
+
+
+def _transcribe_sync(file_path: str, model_size: str = WHISPER_MODEL) -> str:
+    """转录并返回完整文字稿（无进度回调，供 MCP 工具使用）。"""
+    return _transcribe_segments_sync(file_path, model_size)
 
 
 # ── 通用平台流程 ─────────────────────────────────────────

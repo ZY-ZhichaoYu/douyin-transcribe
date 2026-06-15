@@ -13,11 +13,11 @@ Douyin / Bilibili → Text  (Gradio Web UI)
 """
 import asyncio
 import os
+import queue
 import socket
 import sys
 import tempfile
 import time
-from concurrent.futures import TimeoutError as FuturesTimeoutError
 from collections.abc import Generator
 
 import gradio as gr
@@ -30,7 +30,7 @@ from server import (
     _download_video_file,
     _extract_url,
     _platform_label,
-    _transcribe_sync,
+    _transcribe_segments_sync,
     _TRANSCRIBE_EXECUTOR,
 )
 
@@ -72,54 +72,26 @@ def _choose_server_port(default_port: int = 7860) -> int:
     return default_port
 
 
-async def _transcribe_for_ui(url: str, model_size: str, progress) -> tuple[str, str, float]:
-    progress(0.05, desc="提取链接...")
-    real_url = _extract_url(url)
-    platform = _detect_platform(real_url)
-    label = _platform_label(platform)
-
-    with tempfile.TemporaryDirectory(prefix="video_transcribe_") as tmp:
-        progress(0.2, desc=f"{label}: 下载转录媒体（优先音频流）...")
-        media_path, platform = await _download_transcription_media(real_url, tmp)
-        size_mb = os.path.getsize(media_path) / 1024 / 1024
-
-        if model_size == "medium":
-            desc = "Whisper medium 转录中；长视频在 CPU 上可能需要很久..."
-        else:
-            desc = f"Whisper {model_size} 转录中..."
-        progress(0.55, desc=desc)
-
-        loop = asyncio.get_running_loop()
-        text = await loop.run_in_executor(
-            _TRANSCRIBE_EXECUTOR, _transcribe_sync, media_path, model_size
-        )
-
-    return text, platform, size_mb
+def _fmt_secs(seconds: float) -> str:
+    """把秒数格式化成 mm:ss，长视频更直观。"""
+    seconds = max(0, int(round(seconds)))
+    return f"{seconds // 60}:{seconds % 60:02d}"
 
 
-async def _download_for_ui(url: str, progress) -> tuple[str, str, float]:
-    progress(0.05, desc="提取链接...")
-    real_url = _extract_url(url)
-    platform = _detect_platform(real_url)
-    label = _platform_label(platform)
-
-    out_dir = tempfile.mkdtemp(prefix="video_dl_")
-    if platform == "bilibili":
-        desc = "Bilibili: 下载最高画质并合并音视频，较大文件可能需要几分钟..."
-    else:
-        desc = f"{label}: 下载视频..."
-    progress(0.25, desc=desc)
-    out_path, platform = await _download_video_file(real_url, out_dir)
-    size_mb = os.path.getsize(out_path) / 1024 / 1024
-    return out_path, platform, size_mb
+def _stage_line(step: int, total: int, text: str) -> str:
+    """生成统一风格的阶段状态行，例如 “**②/③ 下载媒体** · ...”。"""
+    return f"**{'①②③④'[step - 1]}/{total} {text}**"
 
 
 def transcribe(
     url: str, model_size: str, progress=gr.Progress()
 ) -> Generator[tuple[str, str], None, None]:
     """
-    返回 (transcript_text, status_message)。
-    用 gr.Progress 实时显示阶段。
+    返回 (transcript_text, status_message)，文字稿随转录进度流式更新。
+
+    进度条用 faster-whisper 的分段时间戳算真实百分比：
+    已转录音频秒数 / 音频总秒数。同时把文字稿逐段推到界面，
+    用户能立刻看到转录推进，而不是盯着一个不动的进度条。
     """
     if not url or not url.strip():
         yield "", "请输入抖音或 Bilibili 链接"
@@ -127,50 +99,84 @@ def transcribe(
 
     try:
         progress(0.02, desc="提取链接...")
-        yield "", "进行中：正在提取链接..."
+        yield "", _stage_line(1, 3, "提取链接…")
         real_url = _extract_url(url)
         platform = _detect_platform(real_url)
         label = _platform_label(platform)
 
         with tempfile.TemporaryDirectory(prefix="video_transcribe_") as tmp:
-            progress(0.20, desc=f"{label}: 下载转录媒体...")
-            yield "", f"进行中：{label} 正在下载适合转录的音频/视频流..."
+            progress(0.08, desc=f"{label}: 下载媒体…")
+            yield "", _stage_line(2, 3, f"从 {label} 下载音频/视频流…")
             media_path, platform = asyncio.run(_download_transcription_media(real_url, tmp))
             size_mb = os.path.getsize(media_path) / 1024 / 1024
 
-            if model_size == "medium":
-                desc = "Whisper medium 转录中；长视频在 CPU 上可能需要很久..."
-            else:
-                desc = f"Whisper {model_size} 转录中..."
-            progress((0, None), desc=desc)
-            yield "", f"进行中：已下载 {size_mb:.1f}MB，{desc}"
+            # 把转录丢到单线程执行器里跑，靠队列把每段的进度/文字回传到这里。
+            q: queue.Queue = queue.Queue()
 
-            future = _TRANSCRIBE_EXECUTOR.submit(_transcribe_sync, media_path, model_size)
-            started = time.monotonic()
-            last_reported = -1
-            while True:
+            def on_segment(end: float, total: float, text_so_far: str) -> None:
+                q.put(("seg", end, total, text_so_far))
+
+            def worker() -> None:
                 try:
-                    text = future.result(timeout=1.0)
+                    full = _transcribe_segments_sync(media_path, model_size, on_segment)
+                    q.put(("done", full))
+                except Exception as exc:  # noqa: BLE001 - 转发给主线程统一处理
+                    q.put(("error", exc))
+
+            _TRANSCRIBE_EXECUTOR.submit(worker)
+
+            started = time.monotonic()
+            note = "（medium 在 CPU 上较慢）" if model_size == "medium" else ""
+            progress((0, None), desc=f"Whisper {model_size} 转录中{note}")
+            yield "", _stage_line(3, 3, f"已下载 {size_mb:.1f}MB，Whisper {model_size} 转录中{note}…")
+
+            text = ""
+            while True:
+                kind, *rest = q.get()
+                if kind == "seg":
+                    end, total, text_so_far = rest
+                    elapsed = time.monotonic() - started
+                    if total and total > 0:
+                        frac = min(end / total, 0.999)
+                        progress(frac, desc=f"转录 {frac * 100:.0f}%")
+                        eta = ""
+                        if frac > 0.03:
+                            remain = elapsed * (1 - frac) / frac
+                            eta = f" · 预计剩余 {_fmt_secs(remain)}"
+                        status = _stage_line(
+                            3, 3,
+                            f"转录中 {frac * 100:.0f}% · 音频 {_fmt_secs(end)}/{_fmt_secs(total)}"
+                            f" · 已用 {_fmt_secs(elapsed)}{eta}",
+                        )
+                    else:
+                        progress((end, None), desc="转录中")
+                        status = _stage_line(
+                            3, 3,
+                            f"转录中 · 已处理 {_fmt_secs(end)} · 已用 {_fmt_secs(elapsed)}",
+                        )
+                    yield text_so_far, status
+                elif kind == "done":
+                    text = rest[0]
                     break
-                except FuturesTimeoutError:
-                    elapsed = int(time.monotonic() - started)
-                    bucket = elapsed // 10
-                    progress((elapsed, None), desc=f"{desc} 已运行 {elapsed}s")
-                    if bucket != last_reported:
-                        last_reported = bucket
-                        yield "", f"进行中：{desc} 已运行 {elapsed}s。长视频在 CPU 上会停留较久。"
+                elif kind == "error":
+                    raise rest[0]
     except Exception as e:
         progress(None)
-        yield "", f"处理失败：{_format_error(e)}"
+        yield "", f"❌ 处理失败：{_format_error(e)}"
         return
 
     if not text.strip():
         progress(1.0, desc="完成")
-        yield "", "转录完成，但视频中未检测到语音"
+        yield "", "⚠️ 转录完成，但视频中未检测到语音"
         return
 
     progress(1.0, desc="完成")
-    status = f"完成 | {_platform_label(platform)} | 媒体 {size_mb:.1f}MB | 模型 {model_size}"
+    elapsed = time.monotonic() - started
+    chars = len(text.replace("\n", "").replace(" ", ""))
+    status = (
+        f"✅ **完成** · {_platform_label(platform)} · 媒体 {size_mb:.1f}MB · "
+        f"模型 {model_size} · 约 {chars} 字 · 耗时 {_fmt_secs(elapsed)}"
+    )
     yield text, status
 
 
@@ -337,18 +343,28 @@ with gr.Blocks(title="视频转文字 / Douyin & Bilibili to Text") as demo:
                 with gr.Group(elem_classes="soft-card"):
                     status_out = gr.Markdown("准备就绪，粘贴链接后点击 **开始转录**。")
                     text_out = gr.Textbox(
-                        label="文字稿",
+                        label="文字稿（转录时会逐段实时显示）",
                         lines=22,
-                        buttons=["copy"],
                         elem_id="transcript",
                         placeholder="转录完成后，文字稿会出现在这里，可一键复制给 AI 做摘要 / 翻译 / 分析。",
                     )
+                    copy_btn = gr.Button("📋 复制文字稿", size="sm")
 
         go_btn.click(
             fn=transcribe,
             inputs=[url_in, model_in],
             outputs=[text_out, status_out],
             show_progress_on=status_out,
+        )
+        # 客户端 JS 直接把文字稿写进剪贴板，再由 Python 端弹一个“已复制”提示。
+        copy_btn.click(
+            fn=lambda: gr.Info("已复制到剪贴板 ✓"),
+            inputs=None,
+            outputs=None,
+            js=(
+                "() => { const el = document.querySelector('#transcript textarea');"
+                " if (el && el.value) { navigator.clipboard.writeText(el.value); } }"
+            ),
         )
         dl_btn_main.click(
             fn=download_only,
